@@ -79,6 +79,17 @@ function serverLabel(u) {
   return h + " (self-hosted)";
 }
 
+// Web-vault base URL for "open this entry" deep links, from `bw status`.serverUrl.
+// The desktop app has no per-item deep links, so the web vault is the target.
+let VAULT_WEB = "https://vault.bitwarden.com";
+function vaultWebUrl(u) {
+  if (!u) return "https://vault.bitwarden.com";
+  const base = u.replace(/\/+$/, "");
+  if (base.includes("bitwarden.eu")) return "https://vault.bitwarden.eu";
+  if (base.includes("bitwarden.com")) return "https://vault.bitwarden.com";
+  return base; // self-hosted serves the web vault at the base URL
+}
+
 const MULTI = new Set(["co.uk","org.uk","ac.uk","gov.uk","com.au","net.au","org.au","co.nz","co.jp","co.kr","co.in","com.br","com.cn","com.mx","com.tr","co.za","com.sg","com.hk","com.tw","com.ua","co.il","com.ar","com.co","com.my"]);
 const VALID = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 const hostOf = (uri) => { try { const u = new URL(uri.includes("://") ? uri : `https://${uri}`); return /^https?:$/.test(u.protocol) ? u.hostname.replace(/^www\./, "").toLowerCase() : null; } catch { return null; } };
@@ -167,6 +178,24 @@ function suggestClean(raw){
 const byId = new Map(); // id -> bw item (kept in sync after edits)
 let SECTIONS = { s1: [], s2: [], s3: [], renames: [] };
 
+// Likely-duplicate logins. Grouped strictly: the SAME site host plus the same
+// username (or, when there's no username, the same host + same name). Using the full
+// host (not just the brand) avoids lumping different services of one company together.
+// Detection uses ONLY non-secret fields — passwords are never read or compared.
+function computeDups(logins) {
+  const dmap = new Map();
+  for (const it of logins) {
+    const host = it.login.uris.map((u) => hostOf(u.uri)).find(Boolean) || null;
+    if (!host) continue;
+    const user = (it.login.username || "").trim().toLowerCase();
+    const key = user ? host + "|" + user : host + "|name:" + (it.name || "").trim().toLowerCase();
+    if (!dmap.has(key)) dmap.set(key, []);
+    dmap.get(key).push({ id: it.id, name: it.name || "(no name)", host, username: it.login.username || "" });
+  }
+  return [...dmap.values()].filter((g) => g.length > 1)
+    .sort((a, b) => (a[0].host || a[0].name).localeCompare(b[0].host || b[0].name));
+}
+
 async function classify(onProgress) {
   bw(["sync"]);
   const items = JSON.parse(bw(["list", "items"]));
@@ -231,21 +260,7 @@ async function classify(onProgress) {
     .filter((r) => r.suggested && r.suggested !== r.current)
     .sort((a, b) => a.current.localeCompare(b.current));
 
-  // Likely-duplicate logins. Grouped strictly: the SAME site host plus the same
-  // username (or, when there's no username, the same host + same name). Using the full
-  // host (not just the brand) avoids lumping different services of one company together.
-  // Detection uses ONLY non-secret fields — passwords are never read or compared.
-  const dmap = new Map();
-  for (const it of logins) {
-    const host = it.login.uris.map((u) => hostOf(u.uri)).find(Boolean) || null;
-    if (!host) continue;
-    const user = (it.login.username || "").trim().toLowerCase();
-    const key = user ? host + "|" + user : host + "|name:" + (it.name || "").trim().toLowerCase();
-    if (!dmap.has(key)) dmap.set(key, []);
-    dmap.get(key).push({ id: it.id, name: it.name || "(no name)", host, username: it.login.username || "" });
-  }
-  const dups = [...dmap.values()].filter((g) => g.length > 1)
-    .sort((a, b) => (a[0].host || a[0].name).localeCompare(b[0].host || b[0].name));
+  const dups = computeDups(logins);
 
   SECTIONS = { s1: s1.sort(byName), s2: s2.sort(byName), s3: s3.sort(byName), renames, dups };
 }
@@ -384,7 +399,7 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname.startsWith("/api/") && req.headers["x-favico-token"] !== UI_TOKEN) return send(res, 403, { error: "forbidden" });
     if (req.method === "GET" && url.pathname === "/") return send(res, 200, HTML.replace("__UI_TOKEN__", UI_TOKEN), "text/html");
     if (req.method === "GET" && (url.pathname === "/favicon.svg" || url.pathname === "/favicon.ico")) return send(res, 200, ICON_SVG, "image/svg+xml");
-    if (req.method === "GET" && url.pathname === "/api/data") return send(res, 200, SECTIONS);
+    if (req.method === "GET" && url.pathname === "/api/data") return send(res, 200, { ...SECTIONS, vault: VAULT_WEB });
     if (req.method === "GET" && url.pathname === "/api/search") {
       const q = url.searchParams.get("q") || "";
       const r = await fetch(`${FAVICO}/api/search?q=${encodeURIComponent(q)}`);
@@ -416,6 +431,17 @@ const server = http.createServer(async (req, res) => {
         return { identical };
       });
       return send(res, 200, { groups });
+    }
+    if (req.method === "POST" && url.pathname === "/api/rescan-dups") {
+      // Re-sync the vault and rebuild ONLY the duplicate groups (cheap — no icon
+      // service checks), so fixes made directly in Bitwarden show up immediately.
+      bw(["sync"]);
+      const items = JSON.parse(bw(["list", "items"]));
+      const logins = items.filter((it) => it.type === 1 && it.login?.uris?.length);
+      byId.clear();
+      for (const it of logins) byId.set(it.id, it);
+      SECTIONS.dups = computeDups(logins);
+      return send(res, 200, { dups: SECTIONS.dups });
     }
     if (req.method === "POST" && url.pathname === "/api/commit") {
       const { icons = [], renames = [], deletes = [], merges = [], report = false, synonyms = [] } = await readJson(req);
@@ -615,6 +641,9 @@ small{opacity:.6}
 .switch input:checked+.track{background:#2563eb}
 .switch input:checked+.track:before{transform:translateX(20px)}
 .warnrow{margin-top:6px;font-size:13px;color:#b45309;font-weight:500}
+.openbw{font-size:12px;white-space:nowrap;color:#2563eb;text-decoration:none;margin-left:8px}
+.openbw:hover{text-decoration:underline}
+.duprefresh{display:flex;justify-content:center;align-items:center;gap:8px;margin:20px 0 4px;text-align:center}
 </style></head><body>
 <h1><span class="brandword">favico</span> × Bitwarden <span class="ver">v${VERSION}</span></h1>
 <p class="sub">A guided review of your logins. Adds <code>name.favico.app</code> as URI&nbsp;1 (match&nbsp;=&nbsp;Never) so Bitwarden shows the icon; your real URL moves down and still autofills. <b>Nothing is written to your vault until the final Apply step.</b></p>
@@ -754,9 +783,38 @@ function renderConsent(){
   return wrap;
 }
 
+// Deep link to one entry in the Bitwarden web vault (same server as the CLI),
+// so the copies can be compared side by side. Desktop app has no item links.
+function bwVaultLink(id){
+  const base=(data.vault||'https://vault.bitwarden.com');
+  return '<a class="openbw" href="'+base+'/#/vault?itemId='+encodeURIComponent(id)+'&action=view" target="_blank" rel="noopener" title="Open this entry in the Bitwarden web vault to compare">Open in Bitwarden ↗</a>';
+}
+
 function dupEntryRow(en){
   const ic=en.host?\`<img src="https://icons.bitwarden.net/\${en.host}/icon.png" onerror="this.style.visibility='hidden'">\`:'<span class="noicon">?</span>';
-  return $(\`<div class="dup"><span class="iconcell">\${ic}</span><span class="grow"><span class="name">\${esc(en.name)}</span><span class="host">\${esc(en.username||'no username')}\${en.host?(' · '+esc(en.host)):''}</span></span></div>\`);
+  return $(\`<div class="dup"><span class="iconcell">\${ic}</span><span class="grow"><span class="name">\${esc(en.name)}</span><span class="host">\${esc(en.username||'no username')}\${en.host?(' · '+esc(en.host)):''}</span></span>\${bwVaultLink(en.id)}</div>\`);
+}
+
+// Bottom-of-page refresh: re-sync the vault and rebuild just the duplicate
+// groups (fast), so fixes made directly in Bitwarden disappear from the list.
+function dupRefreshRow(){
+  const w=$('<div class="duprefresh"><button class="primary">Have you fixed these? Then refresh by clicking this button</button><span class="state"></span></div>');
+  const b=w.querySelector('button'), st=w.querySelector('.state');
+  b.onclick=async()=>{
+    b.disabled=true; st.textContent=' syncing with Bitwarden…';
+    try{
+      const r=await (await fetch('/api/rescan-dups',{method:'POST'})).json();
+      data.dups=r.dups||[];
+      dupIndex={}; data.dups.forEach(g=>g.forEach(e=>dupIndex[e.id]=e));
+      // Drop picks that no longer point at a listed duplicate.
+      const ids=new Set(Object.keys(dupIndex));
+      Object.keys(plan.deletes).forEach(id=>{ if(!ids.has(id)) delete plan.deletes[id]; });
+      const keys=new Set((data.dups||[]).map(gkey));
+      Object.keys(plan.merges).forEach(k=>{ if(!keys.has(k)) delete plan.merges[k]; });
+      mount();
+    }catch{ b.disabled=false; st.innerHTML=' <span class="err">refresh failed — try again</span>'; }
+  };
+  return w;
 }
 
 // Merge is deferred to the Apply step: marking a group records it in plan.merges
@@ -768,7 +826,7 @@ function renderDupPick(holder){
     if(g.every(en=>gone[en.id])) return;
     const box=$('<div class="dupgroup"></div>');
     box.appendChild($(\`<div class="duphdr">\${esc(g[0].host||g[0].name)} · \${g.length} entries</div>\`));
-    g.forEach(en=>{ const ck=plan.deletes[en.id]?'checked':''; const ic=en.host?\`<img src="https://icons.bitwarden.net/\${en.host}/icon.png" onerror="this.style.visibility='hidden'">\`:'<span class="noicon">?</span>'; box.appendChild($(\`<label class="dup" data-id="\${en.id}"><input type="checkbox" class="cd" \${ck}><span class="iconcell">\${ic}</span><span class="grow"><span class="name">\${esc(en.name)}</span><span class="host">\${esc(en.username||'no username')}\${en.host?(' · '+esc(en.host)):''}</span></span></label>\`)); });
+    g.forEach(en=>{ const ck=plan.deletes[en.id]?'checked':''; const ic=en.host?\`<img src="https://icons.bitwarden.net/\${en.host}/icon.png" onerror="this.style.visibility='hidden'">\`:'<span class="noicon">?</span>'; box.appendChild($(\`<label class="dup" data-id="\${en.id}"><input type="checkbox" class="cd" \${ck}><span class="iconcell">\${ic}</span><span class="grow"><span class="name">\${esc(en.name)}</span><span class="host">\${esc(en.username||'no username')}\${en.host?(' · '+esc(en.host)):''}</span></span>\${bwVaultLink(en.id)}</label>\`)); });
     holder.appendChild(box);
   });
   holder.addEventListener('change',refreshNav); refreshNav();
@@ -785,6 +843,7 @@ function renderDups(){
     const btn=$('<button class="primary">Show duplicates anyway</button>');
     btn.onclick=()=>{ btn.remove(); renderDupPick(holder); };
     wrap.appendChild(btn); wrap.appendChild(holder);
+    wrap.appendChild(dupRefreshRow());
     wrap.addEventListener('change',refreshNav);
     return wrap;
   }
@@ -792,6 +851,7 @@ function renderDups(){
   wrap.appendChild($('<p class="hint">Identical logins (same username + password) can be <b>merged</b> into one. <b style="color:#dc2626">Passwords are compared on this machine only — never shown or sent.</b></p>'));
   const holder=$('<div class="hint">Checking which duplicates are identical…</div>');
   wrap.appendChild(holder);
+  wrap.appendChild(dupRefreshRow());
   (async()=>{
     let status; try{ status=(await (await fetch('/api/dup-status')).json()).groups||[]; }catch{ status=[]; }
     holder.className=''; holder.innerHTML='';
@@ -1146,6 +1206,7 @@ async function main() {
     console.error("    Re-run:  $env:BW_SESSION = bw unlock --raw   (then start this again)\n");
     process.exit(1);
   }
+  VAULT_WEB = vaultWebUrl(st.serverUrl);
   console.error(`  ✓ favico v${VERSION} — vault unlocked for ${st.userEmail} on ${serverLabel(st.serverUrl)}`);
 
   if (process.argv.includes("--no-backup")) {
