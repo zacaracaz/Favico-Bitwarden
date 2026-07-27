@@ -19,7 +19,7 @@
  */
 import http from "http";
 import { execFileSync, spawn } from "child_process";
-import { mkdirSync } from "fs";
+import { mkdirSync, statfsSync } from "fs";
 import path from "path";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
@@ -34,7 +34,7 @@ const FAVICO = "https://www.favico.app";
 const ROOT = "favico.app";
 const BW_ICONS = "https://icons.bitwarden.net";
 const MATCH_NEVER = 5;
-const VERSION = "2.0.1";
+const VERSION = "2.1.0";
 // Per-run token: the served page carries it and every /api call must echo it.
 // Stops a random website (or DNS rebinding) from driving the local server.
 const UI_TOKEN = crypto.randomBytes(18).toString("hex");
@@ -61,11 +61,45 @@ const ICON_SVG = `<svg id="Layer_1" xmlns="http://www.w3.org/2000/svg" version="
 </svg>`;
 
 const isWin = process.platform === "win32";
+const MIN_FREE_BYTES = 250 * 1024 * 1024;
+function diskFullError(target) {
+  const root = path.parse(path.resolve(target)).root || target;
+  const error = new Error(`${root} does not have enough free space for Bitwarden to save safely. Free at least 250 MB, then run Favico again. No further vault changes were attempted.`);
+  error.code = "ENOSPC";
+  return error;
+}
+function assertWorkingSpace() {
+  for (const target of [...new Set([process.cwd(), process.env.APPDATA].filter(Boolean))]) {
+    try {
+      const stats = statfsSync(target);
+      if (Number(stats.bavail) * Number(stats.bsize) < MIN_FREE_BYTES) throw diskFullError(target);
+    } catch (error) {
+      if (error?.code === "ENOSPC") throw error;
+      // If a platform cannot report space, let Bitwarden handle the operation.
+    }
+  }
+}
+function safeBwError(error, operation) {
+  const raw = [error?.message, error?.stderr?.toString(), error?.stdout?.toString()].filter(Boolean).join("\n");
+  if (/ENOSPC|no space left on device/i.test(raw)) return diskFullError(process.env.APPDATA || process.cwd());
+  const message = /out of date/i.test(raw)
+    ? "Bitwarden says this entry is out of date. Sync Bitwarden, then retry."
+    : /session|vault is locked|not logged in/i.test(raw)
+      ? "The Bitwarden session expired or locked. Run Favico again to unlock it."
+      : `Bitwarden could not complete the ${operation} operation. Sync Bitwarden and retry.`;
+  const safe = new Error(message);
+  safe.code = "BW_COMMAND_FAILED";
+  return safe;
+}
 // On Windows the CLI is bw.cmd/bw.ps1; spawn it through cmd so PATHEXT resolves
 // it and Node's .cmd-spawn restriction doesn't bite.
 function runBw(args, opts) {
   const a = [...args, ...(SESSION ? ["--session", SESSION] : [])];
-  return isWin ? execFileSync("cmd", ["/c", "bw", ...a], opts) : execFileSync("bw", a, opts);
+  try {
+    return isWin ? execFileSync("cmd", ["/c", "bw", ...a], opts) : execFileSync("bw", a, opts);
+  } catch (error) {
+    throw safeBwError(error, args[0] || "requested");
+  }
 }
 function bw(args) {
   return runBw(args, { encoding: "utf8", maxBuffer: 256 * 1024 * 1024 });
@@ -80,21 +114,72 @@ function serverLabel(u) {
   return h + " (self-hosted)";
 }
 
+// Web-vault base URL for "open this entry" deep links, from `bw status`.serverUrl.
+// The desktop app has no per-item deep links, so the web vault is the target.
+let VAULT_WEB = "https://vault.bitwarden.com";
+function vaultWebUrl(u) {
+  if (!u) return "https://vault.bitwarden.com";
+  const base = u.replace(/\/+$/, "");
+  if (base.includes("bitwarden.eu")) return "https://vault.bitwarden.eu";
+  if (base.includes("bitwarden.com")) return "https://vault.bitwarden.com";
+  return base; // self-hosted serves the web vault at the base URL
+}
+
 const MULTI = new Set(["co.uk","org.uk","ac.uk","gov.uk","com.au","net.au","org.au","co.nz","co.jp","co.kr","co.in","com.br","com.cn","com.mx","com.tr","co.za","com.sg","com.hk","com.tw","com.ua","co.il","com.ar","com.co","com.my"]);
 const VALID = /^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$/;
 const hostOf = (uri) => { try { const u = new URL(uri.includes("://") ? uri : `https://${uri}`); return /^https?:$/.test(u.protocol) ? u.hostname.replace(/^www\./, "").toLowerCase() : null; } catch { return null; } };
+const validLoginUri = (uri) => Boolean(hostOf(uri)) || /^[a-z][a-z0-9+.-]*:\S+$/i.test(uri);
 const brandOf = (h) => { if (!h) return null; const p = h.split(".").filter(Boolean); if (p.length < 2) return null; const l2 = p.slice(-2).join("."); const b = MULTI.has(l2) && p.length >= 3 ? p[p.length-3] : p[p.length-2]; return VALID.test(b) ? b : null; };
 const slug = (s) => { const v = (s||"").toLowerCase().replace(/[^a-z0-9-]+/g,"-").replace(/-+/g,"-").replace(/^-+|-+$/g,"").slice(0,63); return VALID.test(v) ? v : null; };
 
 // Node's fetch has no default timeout — one slow/blackholed host could stall the
 // scan for minutes (the "stuck at 99%" tail). Cap every icon-service request.
 const FETCH_TIMEOUT = 8000;
+function imageDimensions(buf) {
+  if (buf.length >= 24 && buf.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) {
+    return { width: buf.readUInt32BE(16), height: buf.readUInt32BE(20) };
+  }
+  if (buf.length >= 10 && (buf.subarray(0, 6).toString("ascii") === "GIF87a" || buf.subarray(0, 6).toString("ascii") === "GIF89a")) {
+    return { width: buf.readUInt16LE(6), height: buf.readUInt16LE(8) };
+  }
+  if (buf.length >= 8 && buf.readUInt16LE(0) === 0 && buf.readUInt16LE(2) === 1 && buf.readUInt16LE(4) > 0) {
+    return { width: buf[6] || 256, height: buf[7] || 256 };
+  }
+  if (buf.length >= 30 && buf.subarray(0, 4).toString("ascii") === "RIFF" && buf.subarray(8, 12).toString("ascii") === "WEBP") {
+    const kind = buf.subarray(12, 16).toString("ascii");
+    if (kind === "VP8X") return { width: 1 + buf.readUIntLE(24, 3), height: 1 + buf.readUIntLE(27, 3) };
+    if (kind === "VP8 ") return { width: buf.readUInt16LE(26) & 0x3fff, height: buf.readUInt16LE(28) & 0x3fff };
+    if (kind === "VP8L" && buf[20] === 0x2f) {
+      const bits = buf.readUInt32LE(21);
+      return { width: (bits & 0x3fff) + 1, height: ((bits >>> 14) & 0x3fff) + 1 };
+    }
+  }
+  if (buf.length >= 4 && buf[0] === 0xff && buf[1] === 0xd8) {
+    let offset = 2;
+    while (offset + 8 < buf.length) {
+      if (buf[offset] !== 0xff) { offset++; continue; }
+      const marker = buf[offset + 1];
+      if (marker === 0xd9 || marker === 0xda) break;
+      const size = buf.readUInt16BE(offset + 2);
+      if (size < 2 || offset + 2 + size > buf.length) break;
+      if ([0xc0, 0xc1, 0xc2, 0xc3, 0xc5, 0xc6, 0xc7, 0xc9, 0xca, 0xcb, 0xcd, 0xce, 0xcf].includes(marker)) {
+        return { width: buf.readUInt16BE(offset + 7), height: buf.readUInt16BE(offset + 5) };
+      }
+      offset += 2 + size;
+    }
+  }
+  return { width: null, height: null };
+}
+const needsQualityImprovement = (icon) =>
+  icon.kind === "icon" && icon.width > 0 && icon.height > 0 && icon.width <= 47 && icon.height <= 47;
+
 async function inspectIcon(url) {
   try {
     const r = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(FETCH_TIMEOUT) });
     if (r.ok) {
-      const hash = crypto.createHash("sha1").update(Buffer.from(await r.arrayBuffer())).digest("hex");
-      return { kind: "icon", hash, status: r.status };
+      const bytes = Buffer.from(await r.arrayBuffer());
+      const hash = crypto.createHash("sha1").update(bytes).digest("hex");
+      return { kind: "icon", hash, status: r.status, ...imageDimensions(bytes) };
     }
     // Bitwarden historically returned a fixed placeholder image for missing
     // icons, but now also returns 404/503. A known-icon health probe below
@@ -199,14 +284,33 @@ function suggestClean(raw){
 }
 
 const byId = new Map(); // id -> bw item (kept in sync after edits)
-let SECTIONS = { s1: [], s2: [], s3: [], renames: [] };
+let SECTIONS = { s1: [], s2: [], quality: [], s3: [], renames: [], dups: [], editor: [] };
+
+// Likely-duplicate logins. Grouped strictly: the SAME site host plus the same
+// username (or, when there's no username, the same host + same name). Using the full
+// host (not just the brand) avoids lumping different services of one company together.
+// Detection uses ONLY non-secret fields — passwords are never read or compared.
+function computeDups(logins) {
+  const dmap = new Map();
+  for (const it of logins) {
+    const host = it.login.uris.map((u) => hostOf(u.uri)).find(Boolean) || null;
+    if (!host) continue;
+    const user = (it.login.username || "").trim().toLowerCase();
+    const key = user ? host + "|" + user : host + "|name:" + (it.name || "").trim().toLowerCase();
+    if (!dmap.has(key)) dmap.set(key, []);
+    dmap.get(key).push({ id: it.id, name: it.name || "(no name)", host, username: it.login.username || "" });
+  }
+  return [...dmap.values()].filter((g) => g.length > 1)
+    .sort((a, b) => (a[0].host || a[0].name).localeCompare(b[0].host || b[0].name));
+}
 
 async function classify(onProgress) {
   bw(["sync"]);
   const items = JSON.parse(bw(["list", "items"]));
-  const logins = items.filter((it) => it.type === 1 && it.login?.uris?.length);
+  const allLogins = items.filter((it) => it.type === 1);
+  const logins = allLogins.filter((it) => it.login?.uris?.length);
   byId.clear();
-  for (const it of logins) byId.set(it.id, it);
+  for (const it of allLogins) byId.set(it.id, it);
 
   // Confirm a known icon works before treating Bitwarden's 404/503 response as
   // a missing icon. Older deployments return a placeholder image instead, so
@@ -225,7 +329,7 @@ async function classify(onProgress) {
     }
   } catch { /* hints are optional */ }
 
-  const s1 = [], s2 = [], s3 = [];
+  const s1 = [], s2 = [], s3 = [], quality = [];
   let progressed = 0;
   if (onProgress) onProgress(0, logins.length);
   await pool(logins, 8, async (it) => {
@@ -239,7 +343,9 @@ async function classify(onProgress) {
       || icon.kind === "unavailable"
       || (icon.kind === "icon" && !defaultHashes.has(icon.hash));
     if (hasIcon) {
-      s3.push({ id: it.id, name: it.name || "(no name)", host, iconUrl: host ? `${BW_ICONS}/${host}/icon.png` : null });
+      const entry = { id: it.id, name: it.name || "(no name)", host, iconUrl: host ? `${BW_ICONS}/${host}/icon.png` : null, width: icon.width || null, height: icon.height || null };
+      s3.push(entry);
+      if (needsQualityImprovement(icon)) quality.push(entry);
       return;
     }
     const cands = [...new Set([(host ? learnedIcons.get(host) : null), brandOf(host), slug(it.name)].filter(Boolean))];
@@ -263,23 +369,20 @@ async function classify(onProgress) {
     .filter((r) => r.suggested && r.suggested !== r.current)
     .sort((a, b) => a.current.localeCompare(b.current));
 
-  // Likely-duplicate logins. Grouped strictly: the SAME site host plus the same
-  // username (or, when there's no username, the same host + same name). Using the full
-  // host (not just the brand) avoids lumping different services of one company together.
-  // Detection uses ONLY non-secret fields — passwords are never read or compared.
-  const dmap = new Map();
-  for (const it of logins) {
-    const host = it.login.uris.map((u) => hostOf(u.uri)).find(Boolean) || null;
-    if (!host) continue;
-    const user = (it.login.username || "").trim().toLowerCase();
-    const key = user ? host + "|" + user : host + "|name:" + (it.name || "").trim().toLowerCase();
-    if (!dmap.has(key)) dmap.set(key, []);
-    dmap.get(key).push({ id: it.id, name: it.name || "(no name)", host, username: it.login.username || "" });
-  }
-  const dups = [...dmap.values()].filter((g) => g.length > 1)
-    .sort((a, b) => (a[0].host || a[0].name).localeCompare(b[0].host || b[0].name));
+  const dups = computeDups(logins);
+  const editor = allLogins.map((it) => {
+    const uris = (it.login?.uris || []).map((u) => u.uri || "").filter(Boolean);
+    const host = uris.map(hostOf).find(Boolean) || null;
+    return {
+      id: it.id,
+      name: it.name || "(no name)",
+      host,
+      uris,
+      iconUrl: host ? `${BW_ICONS}/${host}/icon.png` : null,
+    };
+  }).sort(byName);
 
-  SECTIONS = { s1: s1.sort(byName), s2: s2.sort(byName), s3: s3.sort(byName), renames, dups };
+  SECTIONS = { s1: s1.sort(byName), s2: s2.sort(byName), quality: quality.sort(byName), s3: s3.sort(byName), renames, dups, editor };
 }
 
 function applyRename(id, name) {
@@ -302,13 +405,21 @@ function applyFavico(id, cand) {
 // Apply a rename and/or an icon to one item in a SINGLE edit, so each item is
 // written exactly once. Editing the same item twice in a run fails with
 // Bitwarden's "item is out of date" (the first edit bumps its revisionDate).
-function applyChanges(id, { cand, name }) {
+function applyChanges(id, { cand, name, uris: nextUris }) {
   const it = byId.get(id);
   if (!it) throw new Error("unknown item");
   if (name !== undefined) {
     const nm = (name || "").trim().slice(0, 200);
     if (!nm) throw new Error("empty name");
     it.name = nm;
+  }
+  if (nextUris !== undefined) {
+    const uris = [...new Set((nextUris || []).map((uri) => (uri || "").trim()).filter(Boolean))];
+    if (!uris.every(validLoginUri)) throw new Error("invalid web address");
+    const previous = it.login.uris || [];
+    it.login.uris = uris.map((uri, index) => previous[index]?.match === undefined
+      ? { uri }
+      : { uri, match: previous[index].match });
   }
   if (cand !== undefined) {
     if (!VALID.test(cand)) throw new Error("invalid icon name");
@@ -329,7 +440,79 @@ function deleteItem(id) {
 
 // Equality signature for "same login" — username + password. Computed locally;
 // only used to compare, never returned/shown/logged.
-const loginSig = (it) => (it.login?.username || "") + " " + (it.login?.password || "");
+const loginSig = (it) => (it.login?.username || "") + "\0" + (it.login?.password || "");
+
+// Describe exactly which safe-to-display parts of duplicate entries differ.
+// Secret values are compared locally but never returned to the browser.
+function duplicateComparison(items, comparePasswords = false) {
+  const same = (values) => values.every((value) => value === values[0]);
+  const stable = (value) => JSON.stringify(value ?? null);
+  const secretLabels = (values, emptyLabel, savedLabel) => {
+    const unique = [...new Set(values.filter(Boolean))];
+    return values.map((value) => !value
+      ? emptyLabel
+      : `${savedLabel}${unique.length > 1 ? ` ${unique.indexOf(value) + 1}` : ""}`);
+  };
+  const entries = items.map((it) => {
+    const login = it.login || {};
+    const uris = (login.uris || []).map((u) => u.uri || "").filter(Boolean);
+    const fields = it.fields || [];
+    const attachments = it.attachments || [];
+    const useful = [
+      login.password,
+      login.totp,
+      ...(login.fido2Credentials || []),
+      it.notes,
+      ...fields,
+      ...attachments,
+    ].filter(Boolean);
+    return {
+      id: it.id,
+      name: it.name || "(no name)",
+      username: login.username || "",
+      uris,
+      passwordSig: login.password || "",
+      totpSig: login.totp || "",
+      passkeySig: stable(login.fido2Credentials || []),
+      passkeyCount: (login.fido2Credentials || []).length,
+      notesSig: it.notes || "",
+      fieldsSig: stable(fields),
+      fieldNames: fields.map((f) => f.name || "unnamed"),
+      attachmentsSig: stable(attachments),
+      attachmentNames: attachments.map((a) => a.fileName || "unnamed"),
+      favorite: Boolean(it.favorite),
+      reprompt: Number(it.reprompt || 0),
+      revisionDate: it.revisionDate || "",
+      mostlyEmpty: useful.length === 0,
+    };
+  });
+  const differences = [];
+  const add = (label, raw, display = raw) => {
+    if (!same(raw)) differences.push({ label, values: display });
+  };
+  add("Name", entries.map((e) => e.name));
+  add("Username", entries.map((e) => e.username), entries.map((e) => e.username || "No username"));
+  add("Web addresses", entries.map((e) => stable(e.uris)), entries.map((e) => e.uris.length ? e.uris.join("\n") : "No web address"));
+  if (comparePasswords) {
+    const passwords = entries.map((e) => e.passwordSig);
+    add("Password", passwords, secretLabels(passwords, "No password", "Saved password"));
+  }
+  const totp = entries.map((e) => e.totpSig);
+  add("Authenticator key", totp, secretLabels(totp, "None", "Saved key"));
+  add("Passkeys", entries.map((e) => e.passkeySig), entries.map((e) => `${e.passkeyCount} saved`));
+  const notes = entries.map((e) => e.notesSig);
+  add("Notes", notes, secretLabels(notes, "No notes", "Notes saved"));
+  add("Custom fields", entries.map((e) => e.fieldsSig), entries.map((e) => e.fieldNames.length ? `${e.fieldNames.length} saved: ${e.fieldNames.join(", ")}` : "None"));
+  add("Attachments", entries.map((e) => e.attachmentsSig), entries.map((e) => e.attachmentNames.length ? `${e.attachmentNames.length} saved: ${e.attachmentNames.join(", ")}` : "None"));
+  add("Favourite", entries.map((e) => e.favorite), entries.map((e) => e.favorite ? "Yes" : "No"));
+  add("Master-password reprompt", entries.map((e) => e.reprompt), entries.map((e) => e.reprompt ? "Required" : "Not required"));
+  add("Last updated", entries.map((e) => e.revisionDate), entries.map((e) => e.revisionDate ? new Date(e.revisionDate).toLocaleString() : "Unknown"));
+  return {
+    passwordCompared: comparePasswords,
+    entries: entries.map(({ passwordSig, totpSig, passkeySig, notesSig, fieldsSig, attachmentsSig, ...entry }) => entry),
+    differences,
+  };
+}
 
 // Merge entries that are the same login: keep one, union their URIs, carry over
 // any field the primary lacks, and Trash the rest (recoverable).
@@ -416,7 +599,11 @@ const server = http.createServer(async (req, res) => {
     if (url.pathname.startsWith("/api/") && req.headers["x-favico-token"] !== UI_TOKEN) return send(res, 403, { error: "forbidden" });
     if (req.method === "GET" && url.pathname === "/") return send(res, 200, HTML.replace("__UI_TOKEN__", UI_TOKEN), "text/html");
     if (req.method === "GET" && (url.pathname === "/favicon.svg" || url.pathname === "/favicon.ico")) return send(res, 200, ICON_SVG, "image/svg+xml");
-    if (req.method === "GET" && url.pathname === "/api/data") return send(res, 200, SECTIONS);
+    if (req.method === "GET" && url.pathname === "/api/data") return send(res, 200, { ...SECTIONS, vault: VAULT_WEB });
+    if (req.method === "POST" && url.pathname === "/api/reclassify") {
+      await classify();
+      return send(res, 200, { ...SECTIONS, vault: VAULT_WEB });
+    }
     if (req.method === "GET" && url.pathname === "/api/search") {
       const q = url.searchParams.get("q") || "";
       const r = await fetch(`${FAVICO}/api/search?q=${encodeURIComponent(q)}`);
@@ -440,18 +627,29 @@ const server = http.createServer(async (req, res) => {
       try { applyFavico(id, cand); return send(res, 200, { ok: true }); } catch (e) { return send(res, 400, { ok: false, error: e.message }); }
     }
     if (req.method === "GET" && url.pathname === "/api/dup-status") {
-      // Per-group: are all entries the same login (username+password)? Compared
-      // locally; ONLY the booleans are returned — passwords never leave this process.
+      // Secret values never leave this process; the browser receives only
+      // same/different labels and safe display fields.
+      const comparePasswords = url.searchParams.get("passwords") === "1";
       const groups = (SECTIONS.dups || []).map((g) => {
         const items = g.map((e) => byId.get(e.id)).filter(Boolean);
-        const identical = items.length > 1 && items.length === g.length && items.every((it) => loginSig(it) === loginSig(items[0]));
-        return { identical };
+        return duplicateComparison(items, comparePasswords);
       });
       return send(res, 200, { groups });
     }
+    if (req.method === "POST" && url.pathname === "/api/rescan-dups") {
+      // Re-sync the vault and rebuild ONLY the duplicate groups (cheap — no icon
+      // service checks), so fixes made directly in Bitwarden show up immediately.
+      bw(["sync"]);
+      const items = JSON.parse(bw(["list", "items"]));
+      const logins = items.filter((it) => it.type === 1 && it.login?.uris?.length);
+      byId.clear();
+      for (const it of logins) byId.set(it.id, it);
+      SECTIONS.dups = computeDups(logins);
+      return send(res, 200, { dups: SECTIONS.dups });
+    }
     if (req.method === "POST" && url.pathname === "/api/commit") {
-      const { icons = [], renames = [], deletes = [], merges = [], report = false, synonyms = [] } = await readJson(req);
-      const results = { icons: [], renames: [], deletes: [], merges: [] };
+      const { icons = [], renames = [], urls = [], deletes = [], merges = [], report = false, synonyms = [] } = await readJson(req);
+      const results = { icons: [], renames: [], urls: [], deletes: [], merges: [] };
       // Stream NDJSON progress so the browser can show a live bar + per-item log.
       res.writeHead(200, { "Content-Type": "application/x-ndjson", "Cache-Control": "no-cache" });
       const emit = (o) => { try { res.write(JSON.stringify(o) + "\n"); } catch { /* client gone */ } };
@@ -460,6 +658,7 @@ const server = http.createServer(async (req, res) => {
       const changes = new Map();
       for (const { id, cand } of icons) { const c = changes.get(id) || {}; c.cand = cand; changes.set(id, c); }
       for (const { id, name } of renames) { const c = changes.get(id) || {}; c.name = name; changes.set(id, c); }
+      for (const { id, uris } of urls) { const c = changes.get(id) || {}; c.uris = uris; changes.set(id, c); }
       const total = merges.length + changes.size + deletes.length;
       let done = 0;
       const finish = (label, ok, error) => { done++; emit({ type: "done_item", done, total, label, ok, error }); };
@@ -467,20 +666,22 @@ const server = http.createServer(async (req, res) => {
       const hints = [], iconMatches = [], uses = []; // opted-in sharing
       try {
         emit({ type: "start", total });
+        assertWorkingSpace();
         // 1) merges first (so the surviving entry is fresh before icon/rename edits)
         for (const m of merges) {
           const label = `Merging duplicates of “${nameOf(m.keep)}”`;
           emit({ type: "doing", label }); await tick();
           try { const r = mergeItems(m.ids || [], m.keep); results.merges.push({ ok: true, id: m.keep, ...r }); finish(label, true); }
-          catch (e) { results.merges.push({ ok: false, id: m && m.keep, error: e.message }); finish(label, false, e.message); }
+          catch (e) { results.merges.push({ ok: false, id: m && m.keep, error: e.message }); finish(label, false, e.message); if (e.code === "ENOSPC") throw e; }
         }
         // 2) icon and/or rename per item
         for (const [id, c] of changes) {
           const it = byId.get(id);
           const before = it?.name;
-          const label = (c.cand !== undefined && c.name !== undefined) ? `Updating “${before || id}”`
+          const label = [c.cand, c.name, c.uris].filter((value) => value !== undefined).length > 1 ? `Updating “${before || id}”`
             : (c.cand !== undefined) ? `Setting icon for “${before || id}”`
-            : `Renaming “${before || id}” → “${c.name}”`;
+            : (c.name !== undefined) ? `Renaming “${before || id}” → “${c.name}”`
+            : `Updating web addresses for “${before || id}”`;
           emit({ type: "doing", label }); await tick();
           let host = null;
           for (const u of (it?.login?.uris || [])) { const hh = hostOf(u.uri); if (hh && !(hh === ROOT || hh.endsWith(`.${ROOT}`))) { host = hh; break; } }
@@ -488,11 +689,14 @@ const server = http.createServer(async (req, res) => {
             applyChanges(id, c);
             if (c.cand !== undefined) { results.icons.push({ id, ok: true }); uses.push(c.cand); if (host) iconMatches.push({ host, cand: c.cand }); }
             if (c.name !== undefined) { results.renames.push({ id, ok: true }); if (before && before !== c.name) hints.push({ from: before, to: c.name }); }
+            if (c.uris !== undefined) results.urls.push({ id, ok: true });
             finish(label, true);
           } catch (e) {
             if (c.cand !== undefined) results.icons.push({ id, ok: false, error: e.message });
             if (c.name !== undefined) results.renames.push({ id, ok: false, error: e.message });
+            if (c.uris !== undefined) results.urls.push({ id, ok: false, error: e.message });
             finish(label, false, e.message);
+            if (e.code === "ENOSPC") throw e;
           }
         }
         // 3) deletes (soft-delete to Trash)
@@ -500,7 +704,7 @@ const server = http.createServer(async (req, res) => {
           const label = `Moving “${nameOf(id)}” to Trash`;
           emit({ type: "doing", label }); await tick();
           try { deleteItem(id); results.deletes.push({ id, ok: true }); finish(label, true); }
-          catch (e) { results.deletes.push({ id, ok: false, error: e.message }); finish(label, false, e.message); }
+          catch (e) { results.deletes.push({ id, ok: false, error: e.message }); finish(label, false, e.message); if (e.code === "ENOSPC") throw e; }
         }
         // 4) opt-in anonymous hints (best-effort, timeout-capped so the stream can't hang)
         if (report && (hints.length || iconMatches.length || uses.length || (synonyms || []).length)) {
@@ -550,16 +754,16 @@ body{font-family:system-ui,sans-serif;max-width:880px;margin:0 auto;padding:24px
 h1{margin:0 0 4px}.sub{opacity:.6;font-size:14px;margin:0 0 20px}
 .ver{font-size:12px;opacity:.45;font-weight:400;vertical-align:middle}
 h2{font-size:16px;margin:28px 0 6px}.hint{opacity:.6;font-size:13px;margin:0 0 10px}
-.row{display:flex;align-items:center;gap:10px;padding:7px 8px;border:1px solid #8884;border-radius:8px;margin:6px 0}
-.row img{width:28px;height:28px;border-radius:5px;flex:0 0 auto;background:#8881}
+.row{display:flex;align-items:center;gap:12px;padding:10px;border:1px solid #8884;border-radius:8px;margin:7px 0}
+.row img{width:48px;height:48px;border-radius:8px;object-fit:contain;flex:0 0 auto;background:#8881}
 .name{font-weight:600;font-size:14px}.host{opacity:.55;font-size:12px}
 .grow{flex:1;min-width:0}.grow>div{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 button{font:inherit;border:1px solid #8886;background:#8881;border-radius:7px;padding:6px 12px;cursor:pointer}
 button.primary{background:#2563eb;color:#fff;border-color:#2563eb}
 .arrow{opacity:.4}.done{color:#16a34a;font-size:13px;font-weight:600}.err{color:#dc2626;font-size:12px}
 .pick{position:relative}.results{display:none;position:absolute;right:0;top:34px;z-index:5;background:Canvas;border:1px solid #8886;border-radius:8px;padding:6px;max-height:260px;overflow:auto;width:240px;box-shadow:0 8px 24px #0003}
-.results.open{display:block}.results .r{display:flex;align-items:center;gap:8px;padding:5px;border-radius:6px;cursor:pointer}.results .r:hover{background:#8882}.results img{width:22px;height:22px}
-.chosen{display:flex;align-items:center;gap:6px}.chosen img{width:24px;height:24px;border-radius:5px}
+.results.open{display:block}.results .r{display:flex;align-items:center;gap:8px;padding:5px;border-radius:6px;cursor:pointer}.results .r:hover{background:#8882}.results img{width:48px;height:48px;object-fit:contain}
+.chosen{display:flex;align-items:center;gap:6px}.chosen img{width:48px;height:48px;object-fit:contain;border-radius:8px}
 input[type=search]{font:inherit;padding:5px 8px;border:1px solid #8886;border-radius:7px;width:150px}
 .bar{position:sticky;top:0;background:Canvas;padding:10px 0;display:flex;gap:10px;align-items:center;border-bottom:1px solid #8884;z-index:10}
 small{opacity:.6}
@@ -581,23 +785,32 @@ small{opacity:.6}
 .stp.on{border-color:#2563eb;background:#2563eb22}.stp.on .num{background:#2563eb;color:#fff}
 .stp.done .num{background:#16a34a;color:#fff}
 .selall{display:inline-flex;align-items:center;gap:6px;font-size:13px;opacity:.85;margin:0 0 8px}
-.row .curimg{width:24px;height:24px;border-radius:5px;background:#8881;flex:0 0 auto}
+.row .curimg{width:48px;height:48px;border-radius:8px;background:#8881;flex:0 0 auto}
 .navbar{display:flex;align-items:center;gap:10px;margin-top:24px;padding-top:14px;border-top:1px solid #8884}
 .navbar button{padding:9px 16px}
 .dupgroup{border:1px solid #8884;border-radius:8px;padding:8px 10px;margin:8px 0}
 .duphdr{font-weight:600;font-size:13px;opacity:.75;margin-bottom:4px}
-.dup{display:flex;align-items:center;gap:10px;padding:5px 6px;border-radius:6px;cursor:pointer}
+.dup{display:flex;align-items:center;gap:10px;padding:8px 6px;border-radius:6px}
 .dup:hover{background:#8881}.dup .grow,.crow .grow{flex:1;min-width:0;display:flex;flex-direction:column}
 .dup .grow span,.crow .grow span{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.dupnum{font-size:11px;font-weight:700;opacity:.55}
+.emptybadge{display:inline-block;width:max-content;margin-top:3px;padding:2px 6px;border-radius:999px;background:#f59e0b22;color:#b45309;font-size:11px;font-weight:700}
+.keepbtn{white-space:nowrap}
+.keepnote{margin:8px 6px 2px;padding:8px 10px;border-radius:7px;background:#16a34a18;color:#15803d;font-size:12px;font-weight:600}
+.diffs{width:100%;border-collapse:collapse;margin:8px 0;font-size:12px}
+.diffs caption{text-align:left;font-weight:700;padding:5px 6px}
+.diffs th,.diffs td{text-align:left;vertical-align:top;padding:6px;border-top:1px solid #8883;white-space:pre-line;overflow-wrap:anywhere}
+.diffs th{width:20%;opacity:.7}.diffs td{width:40%}
+.nodiff{margin:8px 6px;font-size:12px;color:#15803d;font-weight:600}
 .summary{display:flex;gap:18px;margin:10px 0;font-size:14px}
 .csec{margin:16px 0}.csec h3{margin:0 0 6px;font-size:14px}
 .crow{display:flex;align-items:center;gap:10px;padding:5px 8px;border:1px solid #8884;border-radius:7px;margin:4px 0}
-.crow .ci{width:24px;height:24px;border-radius:5px;flex:0 0 auto}
+.crow .ci{width:48px;height:48px;object-fit:contain;border-radius:8px;flex:0 0 auto}
 .confirm-actions{display:flex;gap:10px;margin-top:18px;flex-wrap:wrap}
 .proc{font-weight:600}.result{margin-top:12px}
-.iconcell{width:30px;height:30px;flex:0 0 auto;display:grid;place-items:center}
-.iconcell img{width:28px;height:28px;border-radius:5px;background:#8881}
-.iconcell .noicon{width:28px;height:28px;border-radius:5px;background:#8881;display:grid;place-items:center;opacity:.45;font-size:14px;font-weight:700}
+.iconcell{width:52px;height:52px;flex:0 0 auto;display:grid;place-items:center}
+.iconcell img{width:48px;height:48px;object-fit:contain;border-radius:8px;background:#8881}
+.iconcell .noicon{width:48px;height:48px;border-radius:8px;background:#8881;display:grid;place-items:center;opacity:.45;font-size:18px;font-weight:700}
 .row .change{white-space:nowrap}
 .modal.picker{width:440px;max-height:90vh;overflow:auto}
 .tabs{display:flex;gap:6px;margin:2px 0 10px}
@@ -609,10 +822,10 @@ small{opacity:.6}
 .fld small{font-weight:400;opacity:.6}
 .phint{font-size:12px;opacity:.75;margin:6px 0}
 .grid{display:flex;flex-wrap:wrap;gap:6px;margin:8px 0;max-height:150px;overflow:auto}
-.grid .ic{width:56px;height:64px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;border:2px solid transparent;border-radius:9px;background:#8881;cursor:pointer;padding:3px;overflow:hidden}
+.grid .ic{width:72px;height:82px;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:3px;border:2px solid transparent;border-radius:9px;background:#8881;cursor:pointer;padding:3px;overflow:hidden}
 .grid .ic:hover{background:#8882}
-.grid .ic img{width:30px;height:30px;object-fit:contain}
-.grid .ic span{font-size:9px;max-width:50px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.7}
+.grid .ic img{width:48px;height:48px;object-fit:contain}
+.grid .ic span{font-size:9px;max-width:66px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;opacity:.7}
 .grid .ic.sel{border-color:#2563eb;background:#2563eb22;box-shadow:0 0 0 1px #2563eb inset}
 .crop-wrap{margin-top:10px;border-top:1px solid #8884;padding-top:8px}
 .zoomrow{display:flex;align-items:center;gap:8px}.zoomrow input[type=range]{flex:1}
@@ -624,12 +837,13 @@ small{opacity:.6}
 .bgrow{display:flex;align-items:center;gap:10px;margin-top:8px;font-size:13px}
 .bgrow label{display:inline-flex;align-items:center;gap:5px;cursor:pointer}
 .bgrow input[type=color]{width:44px;height:26px;padding:0;border:1px solid #8886;border-radius:6px;background:none;cursor:pointer}
+.bgrow .hexcolor{width:86px;padding:5px 7px;border:1px solid #8886;border-radius:6px;font:12px ui-monospace,monospace;text-transform:uppercase}
 .checker{background-image:linear-gradient(45deg,#8884 25%,transparent 25%),linear-gradient(-45deg,#8884 25%,transparent 25%),linear-gradient(45deg,transparent 75%,#8884 75%),linear-gradient(-45deg,transparent 75%,#8884 75%);background-size:14px 14px;background-position:0 0,0 7px,7px -7px,-7px 0}
 .optrow{display:flex;gap:12px;align-items:flex-start;padding:10px 12px;border:1px solid #8884;border-radius:9px;margin:8px 0}
 .optrow .grow>div{white-space:normal;overflow:visible;text-overflow:clip}
 .optdesc{font-size:12px;opacity:.72;margin-top:3px;line-height:1.45}
-.dupgroup.willmerge{border-color:#16a34a}
-.iconok{font-size:12px;color:#16a34a;margin:-2px 0 8px 40px}
+.dupgroup.willmerge,.dupgroup.willkeep{border-color:#16a34a}
+.iconok{font-size:12px;color:#16a34a;margin:-2px 0 8px 64px}
 .pbar{height:10px;background:#8883;border-radius:6px;overflow:hidden;margin:8px 0}
 .pfill{height:100%;width:0;background:#2563eb;transition:width .25s}
 .pmeta{display:flex;align-items:center;gap:10px;font-size:12px;opacity:.85}
@@ -647,6 +861,23 @@ small{opacity:.6}
 .switch input:checked+.track{background:#2563eb}
 .switch input:checked+.track:before{transform:translateX(20px)}
 .warnrow{margin-top:6px;font-size:13px;color:#b45309;font-weight:500}
+.openbw{font-size:12px;white-space:nowrap;color:#2563eb;text-decoration:none;margin-left:8px}
+.openbw:hover{text-decoration:underline}
+.duprefresh{display:flex;justify-content:center;align-items:center;gap:8px;margin:20px 0 4px;text-align:center}
+.modecards{display:grid;grid-template-columns:1.2fr 1fr;gap:14px;margin:20px 0}
+.modecard{border:1px solid #8884;border-radius:12px;padding:18px;background:#88808}
+.modecard.recommended{border-color:#2563eb;background:#2563eb0d}
+.modecard h2{margin:0 0 6px;font-size:18px}.modecard p{font-size:13px;opacity:.75}
+.modecard ul,.flowextras{font-size:13px;padding-left:20px}.modecard li,.flowextras li{margin:5px 0}
+.modecard button{width:100%;padding:10px;margin-top:8px;font-weight:700}
+.editoritem{border:1px solid #8884;border-radius:10px;padding:10px;margin:8px 0}
+.editorhead{display:flex;align-items:center;gap:12px}
+.editorfields{flex:1;min-width:0;display:grid;gap:7px}
+.editorfields input{width:100%;box-sizing:border-box;padding:7px 9px;border:1px solid #8886;border-radius:7px;font:inherit}
+.editorurls{display:grid;gap:5px;margin:8px 0 0 64px}
+.editorurl{display:flex;gap:6px}.editorurl input{flex:1;min-width:0;padding:7px 9px;border:1px solid #8886;border-radius:7px;font:inherit}
+.editorurl .removeurl{padding:5px 9px}.addurl{margin:7px 0 0 64px;font-size:12px}
+@media(max-width:680px){.modecards{grid-template-columns:1fr}.editorhead{align-items:flex-start;flex-wrap:wrap}.editorfields{flex-basis:calc(100% - 68px)}.editorurls,.addurl{margin-left:0}.openbw{display:none}}
 </style></head><body>
 <h1><span class="brandword">favico</span> × Bitwarden <span class="ver">v${VERSION}</span></h1>
 <p class="sub">A guided review of your logins. Adds <code>name.favico.app</code> as URI&nbsp;1 (match&nbsp;=&nbsp;Never) so Bitwarden shows the icon; your real URL moves down and still autofills. <b>Nothing is written to your vault until the final Apply step.</b></p>
@@ -654,7 +885,7 @@ small{opacity:.6}
 <ul>
 <li>Your vault is decrypted <b>only on this machine</b>, using the Bitwarden session you unlocked. <b>Passwords and other secrets are never sent anywhere and never logged.</b></li>
 <li>Sent to <b>Bitwarden's own icon service</b> (icons.bitwarden.net): each entry's <b>domain</b>, to check whether it already has a favicon. (Bitwarden already stores your vault.)</li>
-<li>Sent to <b>favico.app</b>: brand-name guesses derived from your domains (to find matching icons), anything you type in a <b>search</b> box, and any <b>image you choose/upload</b> (to store as an icon).</li>
+<li>Sent to <b>favico.app</b>: brand-name guesses derived from your domains (to find matching icons), anything you type in a <b>search</b> box, any image/page URL you deliberately enter, and any <b>image you choose/upload</b> (to store as an icon).</li>
 <li><b>Icons you upload or pick from a web search are saved on the favico.app server</b> (they must be, so Bitwarden can fetch them) and added to the <b>shared, searchable library</b> so others with the same site benefit. They hold only the image and the short name you give it — <b>no vault data</b>.</li>
 <li><b>Community hints (opt-in, anonymous):</b> the tool <b>downloads</b> a public list of "old name → new name" and "site → icon" suggestions to improve matching (nothing is sent to fetch it). Only if you turn on the "help improve matching" toggle does it <b>send</b> generic <code>old → new</code> renames, which icon you picked for a site, and icon-usage counts. This is <b>fully anonymised</b> — no account, email, device or user identifier, no URLs and no secrets — so it <b>cannot be linked to you or your Bitwarden account</b>.</li>
 <li><b>Duplicate detection</b> runs entirely on this machine and only looks at each login's <b>site and username</b> — never the password. Anything you choose to remove is <b>soft-deleted to Bitwarden's Trash</b> (recoverable), not erased.</li>
@@ -668,45 +899,56 @@ const _fetch=window.fetch.bind(window);
 window.fetch=(u,o)=>{ o=o||{}; if(typeof u==='string'&&u[0]==='/'){ o.headers={...(o.headers||{}),'x-favico-token':T}; } return _fetch(u,o); };
 const $=(h)=>{const t=document.createElement('template');t.innerHTML=h.trim();return t.content.firstChild};
 let data;
-let plan={icons:{},renames:{},deletes:{},merges:{}}, cur=0, visited={}, committed=false;
+let plan={icons:{},renames:{},urls:{},deletes:{},merges:{}}, cur=0, visited={}, committed=false, appMode='start';
 let consent={compare:false,report:false}, gone={}, pendingSynonyms=[];
 const gkey=(g)=>g.map(e=>e.id).slice().sort().join(',');
 const mergedDrop=(id)=>Object.values(plan.merges).some(m=>m.ids.includes(id)&&id!==m.keep);
-let iconIndex={}, renameIndex={}, dupIndex={};
-async function load(){ data=await (await fetch('/api/data')).json();
-  ['s1','s2','s3'].forEach(s=>(data[s]||[]).forEach(e=>{e._sec=s;iconIndex[e.id]=e;}));
+let iconIndex={}, renameIndex={}, dupIndex={}, editorIndex={};
+function indexData(next){
+  data=next; iconIndex={}; renameIndex={}; dupIndex={}; editorIndex={};
+  ['s1','s2','quality','s3'].forEach(s=>(data[s]||[]).forEach(e=>{e._sec=s;iconIndex[e.id]=e;}));
   (data.renames||[]).forEach(e=>renameIndex[e.id]=e);
   (data.dups||[]).forEach(g=>g.forEach(e=>dupIndex[e.id]=e));
-  mount(); }
+  (data.editor||[]).forEach(e=>editorIndex[e.id]=e);
+}
+async function load(){ indexData(await (await fetch('/api/data')).json()); mount(); }
 function rowBase(e){ const img=e.iconUrl?\`<img src="\${e.iconUrl}" onerror="this.style.visibility='hidden'">\`:'<img>';
   return \`\${img}<div class="grow"><div class="name">\${esc(e.name)}</div><div class="host">\${esc(e.host||'no web URL')}</div></div>\`; }
 function esc(s){return (s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 
-// Order: declutter (remove duplicates) → identify (rename) → beautify (icons) → review.
+// Order: declutter duplicates → apply easy icon matches → identify names → finish icons → review.
 // Entries you mark for removal in step 1 are hidden from the later steps.
-const STEPS=[
+const FLOW_STEPS=[
   {key:'consent',title:'Options',render:renderConsent},
   {key:'dups',title:'Duplicates',render:renderDups},
-  {key:'renames',title:'Rename',render:renderRenames},
   {key:'s1',title:'Matched',render:()=>renderIcons('s1',{pre:true,hint:'A matching icon was found for each entry that has none. Untick any you do not want; fix a wrong match with the search or upload.'})},
+  {key:'renames',title:'Rename',render:renderRenames},
   {key:'s2',title:'Pick icons',render:()=>renderIcons('s2',{hint:'No icon and no automatic match. Search the library, search the web, or upload one — picking an icon ticks the row.'})},
+  {key:'quality',title:'Improve quality',render:()=>renderIcons('quality',{current:true,showResolution:true,hint:'These existing icons are 47×47 pixels or smaller. Choose a sharper library icon, image, or upload; entries you leave untouched keep their current icon.'})},
   {key:'s3',title:'Replace',render:()=>renderIcons('s3',{current:true,hint:'These already have an icon. Optional: pick a replacement; rows you leave untouched keep their current icon.'})},
   {key:'confirm',title:'Review',render:renderConfirm},
 ];
+const EDITOR_STEPS=[
+  {key:'editor',title:'Editor Mode',render:renderEditor},
+  {key:'confirm',title:'Review',render:renderConfirm},
+];
+const currentSteps=()=>appMode==='flow'?FLOW_STEPS:appMode==='editor'?EDITOR_STEPS:[{key:'start',title:'Choose mode',render:renderStart}];
 
 function mount(){
+  const steps=currentSteps();
   const app=document.getElementById('app'); app.innerHTML='';
-  app.appendChild(stepper());
+  if(appMode!=='start') app.appendChild(stepper());
   const body=$('<div id="stepbody"></div>');
-  body.appendChild(STEPS[cur].render());
+  body.appendChild(steps[cur].render());
   app.appendChild(body);
-  app.appendChild(navbar());
+  if(appMode!=='start') app.appendChild(navbar());
   refreshNav();
 }
 
 function stepper(){
+  const steps=currentSteps();
   const s=$('<div class="stepper"></div>');
-  STEPS.forEach((st,i)=>{
+  steps.forEach((st,i)=>{
     const p=$(\`<button class="stp \${i===cur?'on':''} \${i<cur?'done':''}"><span class="num">\${i<cur?'✓':(i+1)}</span><span class="lbl">\${esc(st.title)}</span></button>\`);
     p.onclick=()=>{ collect(); cur=i; mount(); };
     s.appendChild(p);
@@ -714,10 +956,48 @@ function stepper(){
   return s;
 }
 
+function renderStart(){
+  const wrap=$('<div data-step="start"></div>');
+  wrap.appendChild($('<p class="hint">Choose how you want to work with your vault. Nothing changes until you review and apply your selections.</p>'));
+  const cards=$('<div class="modecards"></div>');
+  const flow=$('<section class="modecard recommended"><h2>Go through the flow <span class="done">(recommended)</span></h2><p>The guided experience does the checking and organising for you.</p><ul><li>Finds likely duplicates, states exactly what differs and flags mostly-empty copies</li><li>Suggests confident icon matches and cleaner names</li><li>Finds unresolved entries and icons at 47×47 or lower</li><li>Guides icon search, webpage/image URLs, uploads, cropping and replacement</li><li>Shows a final review and downloads a change record before applying</li></ul><button class="primary chooseflow">Go through the flow</button></section>');
+  const editor=$('<section class="modecard"><h2>Editor Mode</h2><p>A simple manual editor. It shows every login with its name, 48×48 logo and web addresses so you can rename it, change its icon or edit its URLs yourself.</p><p>Editor Mode does not include the guided flow’s duplicate analysis, automatic matches, rename suggestions, missing-icon help or quality checks.</p><button class="chooseeditor">Open Editor Mode</button></section>');
+  flow.querySelector('.chooseflow').onclick=()=>{ appMode='flow';cur=0;mount(); };
+  editor.querySelector('.chooseeditor').onclick=()=>{ appMode='editor';cur=0;mount(); };
+  cards.appendChild(flow); cards.appendChild(editor); wrap.appendChild(cards);
+  return wrap;
+}
+
+function editorUrlRow(value){
+  const row=$(\`<div class="editorurl"><input type="text" class="editurl" value="\${esc(value||'')}" placeholder="https://example.com" aria-label="Login web address"><button type="button" class="removeurl" title="Remove this web address">Remove</button></div>\`);
+  row.querySelector('.removeurl').onclick=()=>row.remove();
+  return row;
+}
+
+function renderEditor(){
+  const wrap=$('<div data-step="editor"></div>');
+  wrap.appendChild($('<p class="hint">Manual editor: every login is shown below. Change any name, icon or web address you want, then continue to review. The recommended guided flow can run after these edits are saved.</p>'));
+  const holder=$('<div></div>');
+  for(const e of (data.editor||[])){
+    const item=$(\`<div class="editoritem" data-id="\${e.id}"><div class="editorhead"><span class="iconcell"></span><div class="editorfields"><input type="text" class="editname" value="\${esc(plan.renames[e.id]||e.name)}" aria-label="Login name"><span class="host">\${esc(e.host||'No web address')}</span></div><button type="button" class="editicon">Change icon…</button>\${bwVaultLink(e.id)}</div><div class="editorurls"></div><button type="button" class="addurl">+ Add web address</button></div>\`);
+    const cell=item.querySelector('.iconcell');
+    const chosen=plan.icons[e.id];
+    cell.innerHTML=chosen?\`<img src="https://\${chosen}.favico.app/favicon.ico" onerror="this.style.visibility='hidden'">\`:(e.iconUrl?\`<img src="\${e.iconUrl}" onerror="this.style.visibility='hidden'">\`:'<span class="noicon">?</span>');
+    const values=plan.urls[e.id]||e.uris||[];
+    const urls=item.querySelector('.editorurls');
+    values.forEach(uri=>urls.appendChild(editorUrlRow(uri)));
+    item.querySelector('.addurl').onclick=()=>{ const row=editorUrlRow(''); urls.appendChild(row); row.querySelector('input').focus(); };
+    item.querySelector('.editicon').onclick=async()=>{ const cand=await pickIcon(e,cell); if(cand)item.querySelector('.editicon').textContent='Change icon again…'; };
+    holder.appendChild(item);
+  }
+  wrap.appendChild(holder);
+  return wrap;
+}
+
 function renderIcons(key,opts){
   opts=opts||{};
   const wrap=$(\`<div data-step="\${key}"></div>\`);
-  const list=(data[key]||[]).filter(e=>!plan.deletes[e.id]&&!gone[e.id]&&!mergedDrop(e.id));
+  const list=(data[key]||[]).filter(e=>!plan.deletes[e.id]&&!gone[e.id]&&!mergedDrop(e.id)&&!(key==='s3'&&plan.icons[e.id]));
   if(opts.hint) wrap.appendChild($(\`<p class="hint">\${opts.hint}</p>\`));
   if(!list.length){ wrap.appendChild($('<p class="hint">Nothing in this section. 🎉</p>')); return wrap; }
   if(key!=='s3') wrap.appendChild($('<label class="selall"><input type="checkbox" class="allchk"'+(key==='s1'?' checked':'')+'> Select all</label>'));
@@ -725,7 +1005,7 @@ function renderIcons(key,opts){
   const seeded=opts.pre&&!visited[key];   // pre-checked default only until the user has touched this step
   for(const e of list){
     const initial=(e.id in plan.icons)?plan.icons[e.id]:(seeded?e.cand:undefined);
-    holder.appendChild(iconRow(e,{cand:initial,current:opts.current}));
+    holder.appendChild(iconRow(e,{cand:initial,current:opts.current,showResolution:opts.showResolution}));
   }
   wrap.appendChild(holder);
   const all=wrap.querySelector('.allchk'); if(all) all.onchange=()=>{ holder.querySelectorAll('.cpick').forEach(c=>{c.checked=all.checked;}); refreshNav(); };
@@ -786,24 +1066,85 @@ function renderConsent(){
   return wrap;
 }
 
-function dupEntryRow(en){
-  const ic=en.host?\`<img src="https://icons.bitwarden.net/\${en.host}/icon.png" onerror="this.style.visibility='hidden'">\`:'<span class="noicon">?</span>';
-  return $(\`<div class="dup"><span class="iconcell">\${ic}</span><span class="grow"><span class="name">\${esc(en.name)}</span><span class="host">\${esc(en.username||'no username')}\${en.host?(' · '+esc(en.host)):''}</span></span></div>\`);
+// Deep link to one entry in the Bitwarden web vault (same server as the CLI),
+// so the copies can be compared side by side. Desktop app has no item links.
+function bwVaultLink(id){
+  const base=(data.vault||'https://vault.bitwarden.com');
+  return '<a class="openbw" href="'+base+'/#/vault?itemId='+encodeURIComponent(id)+'&action=view" target="_blank" rel="noopener" title="Open this entry in the Bitwarden web vault to compare">Open in Bitwarden ↗</a>';
 }
 
-// Merge is deferred to the Apply step: marking a group records it in plan.merges
-// and hides the extra copies from later steps; the merge runs server-side in /api/commit.
+function dupEntryRow(en, detail, index, onKeep, selected){
+  const ic=en.host?\`<img src="https://icons.bitwarden.net/\${en.host}/icon.png" onerror="this.style.visibility='hidden'">\`:'<span class="noicon">?</span>';
+  const row=$(\`<div class="dup"><span class="dupnum">Entry \${index+1}</span><span class="iconcell">\${ic}</span><span class="grow"><span class="name">\${esc(en.name)}</span><span class="host">\${esc(en.username||'no username')}\${en.host?(' · '+esc(en.host)):''}</span>\${detail&&detail.mostlyEmpty?'<span class="emptybadge">Mostly empty — no password or other saved details</span>':''}</span>\${bwVaultLink(en.id)}<button class="keepbtn\${selected?' primary':''}">\${selected?'Keeping this one':'Keep this one'}</button></div>\`);
+  row.querySelector('.keepbtn').onclick=onKeep;
+  return row;
+}
 
-// "Show anyway" path (compare off): pick-to-remove, deferred to Trash on Apply.
-function renderDupPick(holder){
-  (data.dups||[]).forEach(g=>{
+// Bottom-of-page refresh: re-sync the vault and rebuild just the duplicate
+// groups (fast), so fixes made directly in Bitwarden disappear from the list.
+function dupRefreshRow(){
+  const w=$('<div class="duprefresh"><button class="primary">Have you fixed these? Then refresh by clicking this button</button><span class="state"></span></div>');
+  const b=w.querySelector('button'), st=w.querySelector('.state');
+  b.onclick=async()=>{
+    b.disabled=true; st.textContent=' syncing with Bitwarden…';
+    try{
+      const r=await (await fetch('/api/rescan-dups',{method:'POST'})).json();
+      data.dups=r.dups||[];
+      dupIndex={}; data.dups.forEach(g=>g.forEach(e=>dupIndex[e.id]=e));
+      // Drop picks that no longer point at a listed duplicate.
+      const ids=new Set(Object.keys(dupIndex));
+      Object.keys(plan.deletes).forEach(id=>{ if(!ids.has(id)) delete plan.deletes[id]; });
+      const keys=new Set((data.dups||[]).map(gkey));
+      Object.keys(plan.merges).forEach(k=>{ if(!keys.has(k)) delete plan.merges[k]; });
+      mount();
+    }catch{ b.disabled=false; st.innerHTML=' <span class="err">refresh failed — try again</span>'; }
+  };
+  return w;
+}
+
+function selectedKeeper(g){
+  return g.find(en=>!plan.deletes[en.id]&&g.every(other=>other.id===en.id||plan.deletes[other.id]));
+}
+
+function renderDifferenceTable(comparison){
+  if(!comparison||!comparison.differences||!comparison.differences.length) return $('<div class="nodiff">No differences found in the compared fields.</div>');
+  const cols=(comparison.entries||[]).map((_,i)=>\`<th>Entry \${i+1}</th>\`).join('');
+  const rows=comparison.differences.map(d=>\`<tr><th>\${esc(d.label)}</th>\${d.values.map(v=>\`<td>\${esc(String(v))}</td>\`).join('')}</tr>\`).join('');
+  return $(\`<table class="diffs"><caption>Exactly what is different</caption><thead><tr><th>Detail</th>\${cols}</tr></thead><tbody>\${rows}</tbody></table>\`);
+}
+
+async function renderDupGroups(holder, comparePasswords){
+  let status; try{ status=(await (await fetch('/api/dup-status?passwords='+(comparePasswords?'1':'0'))).json()).groups||[]; }catch{ status=[]; }
+  holder.className=''; holder.innerHTML='';
+  (data.dups||[]).forEach((g,i)=>{
     if(g.every(en=>gone[en.id])) return;
-    const box=$('<div class="dupgroup"></div>');
+    const comparison=status[i]||{entries:[],differences:[]};
+    const keeper=selectedKeeper(g);
+    const box=$(keeper?'<div class="dupgroup willkeep"></div>':'<div class="dupgroup"></div>');
     box.appendChild($(\`<div class="duphdr">\${esc(g[0].host||g[0].name)} · \${g.length} entries</div>\`));
-    g.forEach(en=>{ const ck=plan.deletes[en.id]?'checked':''; const ic=en.host?\`<img src="https://icons.bitwarden.net/\${en.host}/icon.png" onerror="this.style.visibility='hidden'">\`:'<span class="noicon">?</span>'; box.appendChild($(\`<label class="dup" data-id="\${en.id}"><input type="checkbox" class="cd" \${ck}><span class="iconcell">\${ic}</span><span class="grow"><span class="name">\${esc(en.name)}</span><span class="host">\${esc(en.username||'no username')}\${en.host?(' · '+esc(en.host)):''}</span></span></label>\`)); });
+    g.forEach((en,j)=>{
+      const choose=()=>{
+        delete plan.merges[gkey(g)];
+        g.forEach(other=>{
+          if(other.id===en.id) delete plan.deletes[other.id];
+          else { plan.deletes[other.id]=true; delete plan.icons[other.id]; delete plan.renames[other.id]; }
+        });
+        mount();
+      };
+      box.appendChild(dupEntryRow(en,comparison.entries[j],j,choose,keeper&&keeper.id===en.id));
+    });
+    box.appendChild(renderDifferenceTable(comparison));
+    if(!comparePasswords) box.appendChild($('<div class="warnrow">Password differences were not checked because password comparison is off.</div>'));
+    if(keeper){
+      const count=g.length-1;
+      const note=$(\`<div class="keepnote">Keeping Entry \${g.indexOf(keeper)+1}. \${count===1?'The other entry':\`The other \${count} entries\`} will go to Bitwarden’s Trash only when you click Apply. \${count===1?'It is':'They are'} never permanently deleted. <button class="undo">Undo</button></div>\`);
+      note.querySelector('.undo').onclick=()=>{ g.forEach(en=>delete plan.deletes[en.id]); mount(); };
+      box.appendChild(note);
+    }
     holder.appendChild(box);
   });
-  holder.addEventListener('change',refreshNav); refreshNav();
+  if(!holder.children.length) holder.appendChild($('<p class="hint">All duplicate groups handled. 🎉</p>'));
+  refreshNav();
 }
 
 function renderDups(){
@@ -812,55 +1153,37 @@ function renderDups(){
   if(!remaining.length){ wrap.appendChild($('<p class="hint">No duplicate logins\\u00a0— or all handled. 🎉</p>')); return wrap; }
 
   if(!consent.compare){
-    wrap.appendChild($('<p class="hint">You chose not to let the tool compare passwords, so these are matched on <b>site + username only</b> — entries below may actually be <b>different logins</b>. <b style="color:#dc2626">Passwords are never read or compared.</b> Hidden until you choose to show them.</p>'));
+    wrap.appendChild($('<p class="hint">You chose not to let the tool compare passwords, so these are matched on <b>site + username only</b>. Favico can still show every other difference, but the entries may be different logins. <b style="color:#dc2626">Passwords are never read or compared.</b></p>'));
     const holder=$('<div></div>');
     const btn=$('<button class="primary">Show duplicates anyway</button>');
-    btn.onclick=()=>{ btn.remove(); renderDupPick(holder); };
+    btn.onclick=()=>{ btn.remove(); holder.className='hint'; holder.textContent='Comparing entry details…'; renderDupGroups(holder,false); };
     wrap.appendChild(btn); wrap.appendChild(holder);
-    wrap.addEventListener('change',refreshNav);
+    wrap.appendChild(dupRefreshRow());
     return wrap;
   }
 
-  wrap.appendChild($('<p class="hint">Identical logins (same username + password) can be <b>merged</b> into one. <b style="color:#dc2626">Passwords are compared on this machine only — never shown or sent.</b></p>'));
-  const holder=$('<div class="hint">Checking which duplicates are identical…</div>');
+  wrap.appendChild($('<p class="hint">Favico shows exactly which saved details differ. Choose <b>Keep this one</b> on the entry you want; the other copy goes to Bitwarden’s Trash when you click Apply and is <b>never permanently deleted</b>. Passwords are compared on this machine only — never shown or sent.</p>'));
+  const holder=$('<div class="hint">Comparing entry details…</div>');
   wrap.appendChild(holder);
-  (async()=>{
-    let status; try{ status=(await (await fetch('/api/dup-status')).json()).groups||[]; }catch{ status=[]; }
-    holder.className=''; holder.innerHTML='';
-    (data.dups||[]).forEach((g,i)=>{
-      if(g.every(en=>gone[en.id])) return;
-      const box=$('<div class="dupgroup"></div>');
-      box.appendChild($(\`<div class="duphdr">\${esc(g[0].host||g[0].name)} · \${g.length} entries</div>\`));
-      g.forEach(en=>box.appendChild(dupEntryRow(en)));
-      if(status[i] && status[i].identical){
-        const gk=gkey(g);
-        const bar=$('<div class="row2"></div>'); const m=$('<button></button>'); const st=$('<span class="state"></span>');
-        const sync=()=>{ const on=(gk in plan.merges); m.textContent=on?'Don\\'t merge':'Merge into one'; m.classList.toggle('primary',!on); box.classList.toggle('willmerge',on); st.innerHTML=on?' <span class="done">✓ Will be merged when you click Apply — extra copies go to Trash.</span>':''; };
-        m.onclick=()=>{ if(gk in plan.merges) delete plan.merges[gk]; else { plan.merges[gk]={keep:g[0].id,ids:g.map(e=>e.id)}; g.forEach(e=>{ if(e.id!==g[0].id){ delete plan.icons[e.id]; delete plan.renames[e.id]; delete plan.deletes[e.id]; } }); } sync(); };
-        sync(); bar.appendChild(m); bar.appendChild(st); box.appendChild(bar);
-      } else {
-        box.appendChild($('<div class="warnrow">⚠ Different details — review manually in Bitwarden.</div>'));
-      }
-      holder.appendChild(box);
-    });
-    if(!holder.children.length) holder.appendChild($('<p class="hint">All duplicate groups handled. 🎉</p>'));
-  })();
+  wrap.appendChild(dupRefreshRow());
+  renderDupGroups(holder,true);
   return wrap;
 }
 
 function renderConfirm(){
   const wrap=$('<div data-step="confirm"></div>');
-  const icons=Object.entries(plan.icons), renames=Object.entries(plan.renames), deletes=Object.keys(plan.deletes), merges=Object.values(plan.merges);
+  const icons=Object.entries(plan.icons), renames=Object.entries(plan.renames), urls=Object.entries(plan.urls), deletes=Object.keys(plan.deletes), merges=Object.values(plan.merges);
   wrap.appendChild($('<p class="hint">Review everything below. <b>Nothing has changed in your vault yet</b> — changes apply only when you click Apply.</p>'));
-  wrap.appendChild($(\`<div class="summary"><span><b>\${icons.length}</b> icon\${icons.length===1?'':'s'}</span><span><b>\${renames.length}</b> rename\${renames.length===1?'':'s'}</span><span><b>\${merges.length}</b> merge\${merges.length===1?'':'s'}</span><span><b>\${deletes.length}</b> to Trash</span></div>\`));
+  wrap.appendChild($(\`<div class="summary"><span><b>\${icons.length}</b> icon\${icons.length===1?'':'s'}</span><span><b>\${renames.length}</b> rename\${renames.length===1?'':'s'}</span><span><b>\${urls.length}</b> URL update\${urls.length===1?'':'s'}</span><span><b>\${merges.length}</b> merge\${merges.length===1?'':'s'}</span><span><b>\${deletes.length}</b> to Trash</span></div>\`));
   if(icons.length){ const sec=$('<div class="csec"><h3>Icons</h3></div>'); icons.forEach(([id,cand])=>{ const r=renameIndex[id]; const e=iconIndex[id]||dupIndex[id]||(r?{name:r.current,host:r.host}:null)||{}; const rep=e._sec==='s3'; sec.appendChild($(\`<div class="crow"><img class="ci" src="https://\${cand}.favico.app/favicon.ico" onerror="this.style.visibility='hidden'"><span class="grow"><span class="name">\${esc(e.name||id)}</span><span class="host">\${rep?'replace':'add'} → \${esc(cand)}.favico.app\${e.host?(' · '+esc(e.host)):''}</span></span></div>\`)); }); wrap.appendChild(sec); }
-  if(renames.length){ const sec=$('<div class="csec"><h3>Renames</h3></div>'); renames.forEach(([id,name])=>{ const e=renameIndex[id]||{}; const cand=plan.icons[id]; const ic=cand?\`<img class="ci" src="https://\${cand}.favico.app/favicon.ico" onerror="this.style.visibility='hidden'">\`:(e.host?\`<img class="ci" src="https://icons.bitwarden.net/\${e.host}/icon.png" onerror="this.style.visibility='hidden'">\`:''); sec.appendChild($(\`<div class="crow">\${ic}<span class="grow"><span class="name">\${esc(name)}</span><span class="host">was: \${esc(e.current||'')}</span></span></div>\`)); }); wrap.appendChild(sec); }
+  if(renames.length){ const sec=$('<div class="csec"><h3>Renames</h3></div>'); renames.forEach(([id,name])=>{ const e=renameIndex[id]||editorIndex[id]||{}; const cand=plan.icons[id]; const ic=cand?\`<img class="ci" src="https://\${cand}.favico.app/favicon.ico" onerror="this.style.visibility='hidden'">\`:(e.host?\`<img class="ci" src="https://icons.bitwarden.net/\${e.host}/icon.png" onerror="this.style.visibility='hidden'">\`:''); sec.appendChild($(\`<div class="crow">\${ic}<span class="grow"><span class="name">\${esc(name)}</span><span class="host">was: \${esc(e.current||e.name||'')}</span></span></div>\`)); }); wrap.appendChild(sec); }
+  if(urls.length){ const sec=$('<div class="csec"><h3>Web addresses</h3></div>'); urls.forEach(([id,next])=>{ const e=editorIndex[id]||{}; sec.appendChild($(\`<div class="crow"><span class="grow"><span class="name">\${esc(plan.renames[id]||e.name||id)}</span><span class="host">was: \${esc((e.uris||[]).join(' · ')||'none')}</span><span class="host">will be: \${esc((next||[]).join(' · ')||'none')}</span></span></div>\`)); }); wrap.appendChild(sec); }
   if(deletes.length){ const sec=$('<div class="csec"><h3>Move to Trash</h3></div>'); sec.appendChild($('<p class="hint">Recoverable from Bitwarden Trash, <code>bw restore item &lt;id&gt;</code>, or your encrypted backup.</p>')); deletes.forEach(id=>{ const e=dupIndex[id]||{}; sec.appendChild($(\`<div class="crow"><span class="grow"><span class="name">\${esc(e.name||id)}</span><span class="host">\${esc(e.username||'no username')}\${e.host?(' · '+esc(e.host)):''}</span></span></div>\`)); }); wrap.appendChild(sec); }
   if(merges.length){ const sec=$('<div class="csec"><h3>Merges</h3></div>'); sec.appendChild($('<p class="hint">Each group becomes one entry (web addresses combined); the extra copies move to Trash (recoverable).</p>')); merges.forEach(m=>{ const e=dupIndex[m.keep]||{}; const drop=m.ids.length-1; const ic=e.host?\`<img class="ci" src="https://icons.bitwarden.net/\${e.host}/icon.png" onerror="this.style.visibility='hidden'">\`:''; sec.appendChild($(\`<div class="crow">\${ic}<span class="grow"><span class="name">\${esc(e.name||m.keep)}</span><span class="host">merge \${m.ids.length} → 1 · \${drop} to Trash\${e.host?(' · '+esc(e.host)):''}</span></span></div>\`)); }); wrap.appendChild(sec); }
-  if(!icons.length&&!renames.length&&!deletes.length&&!merges.length) wrap.appendChild($('<p class="hint">No changes selected. Go back to pick some — or just close the tool, nothing will happen.</p>'));
+  if(!icons.length&&!renames.length&&!urls.length&&!deletes.length&&!merges.length) wrap.appendChild($('<p class="hint">No changes selected. Go back to pick some — or just close the tool, nothing will happen.</p>'));
   const actions=$('<div class="confirm-actions"></div>');
   const dl=$('<button class="dl">⬇ Download change record</button>'); dl.onclick=downloadRecord; actions.appendChild(dl);
-  const apply=$('<button class="primary apply">Apply changes</button>'); if(committed||(!icons.length&&!renames.length&&!deletes.length&&!merges.length)) apply.disabled=true; apply.onclick=()=>commit(apply,dl); actions.appendChild(apply);
+  const apply=$('<button class="primary apply">Apply changes</button>'); if(committed||(!icons.length&&!renames.length&&!urls.length&&!deletes.length&&!merges.length)) apply.disabled=true; apply.onclick=()=>commit(apply,dl); actions.appendChild(apply);
   wrap.appendChild(actions);
   if(committed) wrap.appendChild($('<p class="hint">These changes were already applied in this session. Reload the page to start a fresh pass.</p>'));
   wrap.appendChild($('<div class="result" id="commitresult"></div>'));
@@ -878,25 +1201,28 @@ function collect(){
   const body=document.getElementById('stepbody'); if(!body)return;
   const step=body.querySelector('[data-step]'); if(!step)return;
   const key=step.dataset.step; visited[key]=true;
-  if(key==='s1'||key==='s2'||key==='s3'){ step.querySelectorAll('.row[data-id]').forEach(r=>{ const id=r.dataset.id, cb=r.querySelector('.cpick'); if(cb&&cb.checked&&r.dataset.cand) plan.icons[id]=r.dataset.cand; else delete plan.icons[id]; }); }
+  if(key==='s1'||key==='s2'||key==='quality'||key==='s3'){ step.querySelectorAll('.row[data-id]').forEach(r=>{ const id=r.dataset.id, cb=r.querySelector('.cpick'); if(cb&&cb.checked&&r.dataset.cand) plan.icons[id]=r.dataset.cand; else delete plan.icons[id]; }); }
   else if(key==='renames'){ step.querySelectorAll('.row[data-id]').forEach(r=>{ const id=r.dataset.id, cb=r.querySelector('.cr'), nm=r.querySelector('.newname').value.trim(); if(cb.checked&&nm) plan.renames[id]=nm; else delete plan.renames[id]; }); }
-  else if(key==='dups'){ step.querySelectorAll('.dup[data-id]').forEach(r=>{ const id=r.dataset.id; if(r.querySelector('.cd').checked){ plan.deletes[id]=true; delete plan.icons[id]; delete plan.renames[id]; } else delete plan.deletes[id]; }); }
+  else if(key==='dups'){ /* Keep-this-one buttons update the deferred plan immediately. */ }
+  else if(key==='editor'){ step.querySelectorAll('.editoritem[data-id]').forEach(item=>{ const id=item.dataset.id,e=editorIndex[id]; if(!e)return; const name=item.querySelector('.editname').value.trim(); if(name&&name!==e.name)plan.renames[id]=name; else delete plan.renames[id]; const uris=[...item.querySelectorAll('.editurl')].map(input=>input.value.trim()).filter(Boolean); if(JSON.stringify(uris)!==JSON.stringify(e.uris||[]))plan.urls[id]=uris; else delete plan.urls[id]; }); }
 }
 
 function countTicks(){
   const body=document.getElementById('stepbody'); if(!body)return 0;
   const step=body.querySelector('[data-step]'); if(!step)return 0;
   const key=step.dataset.step;
-  if(key==='s1'||key==='s2'||key==='s3') return [...step.querySelectorAll('.cpick:checked')].filter(c=>c.closest('.row').dataset.cand).length;
+  if(key==='s1'||key==='s2'||key==='quality'||key==='s3') return [...step.querySelectorAll('.cpick:checked')].filter(c=>c.closest('.row').dataset.cand).length;
   if(key==='renames') return step.querySelectorAll('.cr:checked').length;
-  if(key==='dups') return step.querySelectorAll('.cd:checked').length;
+  if(key==='dups') return Object.keys(plan.deletes).length;
+  if(key==='editor') return Object.keys(plan.icons).length+Object.keys(plan.renames).length+Object.keys(plan.urls).length;
   return 0;
 }
 
 function navbar(){
+  const steps=currentSteps();
   const n=$('<div class="navbar"></div>');
   const back=$('<button class="back">← Back</button>'); back.onclick=()=>{ collect(); if(cur>0){cur--;mount();} };
-  const next=$('<button class="primary next"></button>'); next.onclick=()=>{ collect(); if(cur<STEPS.length-1){cur++;mount();} };
+  const next=$('<button class="primary next"></button>'); next.onclick=()=>{ collect(); if(cur<steps.length-1){cur++;mount();} };
   n.appendChild(back); n.appendChild($('<div style="flex:1"></div>')); n.appendChild(next);
   return n;
 }
@@ -905,19 +1231,20 @@ function refreshNav(){
   const back=document.querySelector('.navbar .back'), next=document.querySelector('.navbar .next');
   if(!next)return;
   back.style.visibility=cur===0?'hidden':'visible';
-  const key=STEPS[cur].key;
+  const key=currentSteps()[cur].key;
   if(key==='confirm'){ next.style.display='none'; return; }
   next.style.display='';
-  if(key==='consent'||(key==='dups'&&consent.compare)){ next.textContent='Continue →'; return; }
+  if(key==='consent'||key==='editor'||(key==='dups'&&consent.compare)){ next.textContent=key==='editor'?'Review changes →':'Continue →'; return; }
   next.textContent=countTicks()>0?'Confirm selections →':'Skip this section →';
 }
 
 function buildRecord(){
-  const icons=Object.entries(plan.icons).map(([id,cand])=>{ const e=iconIndex[id]||{}; return {id,name:e.name||null,host:e.host||null,oldIconUrl:e.iconUrl||null,newIconUri:'https://'+cand+'.favico.app',replacesExisting:e._sec==='s3'}; });
-  const renames=Object.entries(plan.renames).map(([id,name])=>{ const e=renameIndex[id]||{}; return {id,oldName:e.current||null,newName:name}; });
+  const icons=Object.entries(plan.icons).map(([id,cand])=>{ const e=iconIndex[id]||editorIndex[id]||{}; return {id,name:e.name||null,host:e.host||null,oldIconUrl:e.iconUrl||null,newIconUri:'https://'+cand+'.favico.app',replacesExisting:Boolean(e.iconUrl)}; });
+  const renames=Object.entries(plan.renames).map(([id,name])=>{ const e=renameIndex[id]||editorIndex[id]||{}; return {id,oldName:e.current||e.name||null,newName:name}; });
+  const urls=Object.entries(plan.urls).map(([id,uris])=>{ const e=editorIndex[id]||{}; return {id,name:plan.renames[id]||e.name||null,oldUris:e.uris||[],newUris:uris}; });
   const deletes=Object.keys(plan.deletes).map(id=>{ const e=dupIndex[id]||{}; return {id,name:e.name||null,host:e.host||null,username:e.username||null}; });
   const merges=Object.values(plan.merges).map(m=>({keep:m.keep,ids:m.ids,toTrash:m.ids.filter(id=>id!==m.keep)}));
-  return {tool:'favico × Bitwarden',generatedAt:new Date().toISOString(),note:'For your records — passwords are NOT included.',summary:{icons:icons.length,renames:renames.length,merges:merges.length,deletes:deletes.length},icons,renames,merges,deletes,howToRevert:{icons:'Remove the *.favico.app URI from the entry, or use the Revert button in this tool.',renames:'Set the entry name back to oldName.',merges:'Merged-away copies are in Bitwarden Trash — restore them to undo a merge.',deletes:'Restore from Bitwarden Trash, run "bw restore item <id>", or re-import the encrypted backup.'}};
+  return {tool:'favico × Bitwarden',generatedAt:new Date().toISOString(),note:'For your records — passwords are NOT included.',summary:{icons:icons.length,renames:renames.length,urls:urls.length,merges:merges.length,deletes:deletes.length},icons,renames,urls,merges,deletes,howToRevert:{icons:'Remove the *.favico.app URI from the entry, or use the Revert button in this tool.',renames:'Set the entry name back to oldName.',urls:'Restore oldUris from this record.',merges:'Merged-away copies are in Bitwarden Trash — restore them to undo a merge.',deletes:'Restore from Bitwarden Trash, run "bw restore item <id>", or re-import the encrypted backup.'}};
 }
 
 function downloadRecord(){
@@ -929,9 +1256,10 @@ function downloadRecord(){
 async function commit(apply,dl){
   const icons=Object.entries(plan.icons).map(([id,cand])=>({id,cand}));
   const renames=Object.entries(plan.renames).map(([id,name])=>({id,name}));
+  const urls=Object.entries(plan.urls).map(([id,uris])=>({id,uris}));
   const deletes=Object.keys(plan.deletes);
   const merges=Object.values(plan.merges);
-  const total=icons.length+renames.length+deletes.length+merges.length; if(!total)return;
+  const total=icons.length+renames.length+urls.length+deletes.length+merges.length; if(!total)return;
   downloadRecord();
   apply.disabled=true; dl.disabled=true;
   const bg=$('<div class="modal-bg"></div>');
@@ -950,19 +1278,25 @@ async function commit(apply,dl){
   }
   function finishUp(){
     if(finished) return; finished=true; committed=true;
-    const r=results||{icons:[],renames:[],deletes:[],merges:[]};
+    const r=results||{icons:[],renames:[],urls:[],deletes:[],merges:[]};
     const sum=a=>({ok:(a||[]).filter(x=>x.ok).length,n:(a||[]).length});
-    const si=sum(r.icons),sr=sum(r.renames),sd=sum(r.deletes),sm=sum(r.merges);
-    const nf=(si.n-si.ok)+(sr.n-sr.ok)+(sd.n-sd.ok)+(sm.n-sm.ok);
+    const si=sum(r.icons),sr=sum(r.renames),su=sum(r.urls),sd=sum(r.deletes),sm=sum(r.merges);
+    const nf=(si.n-si.ok)+(sr.n-sr.ok)+(su.n-su.ok)+(sd.n-sd.ok)+(sm.n-sm.ok);
     ptitle.textContent=nf?'Done — with some errors':'All done ✓';
-    psum.innerHTML='<div class="tally"><span>Icons '+si.ok+'/'+si.n+'</span><span>Renames '+sr.ok+'/'+sr.n+'</span><span>Merges '+sm.ok+'/'+sm.n+'</span><span>Trash '+sd.ok+'/'+sd.n+'</span></div>'+(nf?'<p class="err">'+nf+' failed — open “Show details”.</p>':'')+'<p class="hint">Open Bitwarden and <b>Sync</b> to see the changes. Your change record was downloaded.</p><p class="hint">Let us know how it went — <a href="https://github.com/zacaracaz/favico-bitwarden/discussions" target="_blank" rel="noopener">share feedback on GitHub</a> or email <a href="mailto:support@favico.app">support@favico.app</a>.</p>';
+    psum.innerHTML='<div class="tally"><span>Icons '+si.ok+'/'+si.n+'</span><span>Renames '+sr.ok+'/'+sr.n+'</span><span>URLs '+su.ok+'/'+su.n+'</span><span>Merges '+sm.ok+'/'+sm.n+'</span><span>Trash '+sd.ok+'/'+sd.n+'</span></div>'+(nf?'<p class="err">'+nf+' failed — open “Show details”.</p>':'')+'<p class="hint">Open Bitwarden and <b>Sync</b> to see the changes. Your change record was downloaded.</p><p class="hint">Let us know how it went — <a href="https://github.com/zacaracaz/favico-bitwarden/discussions" target="_blank" rel="noopener">share feedback on GitHub</a> or email <a href="mailto:support@favico.app">support@favico.app</a>.</p>';
     phint.remove();
-    const close=$('<button class="primary pclose">All done — close this window</button>');
+    if(appMode==='editor'&&!nf){
+      psum.insertAdjacentHTML('beforeend','<h3>Would you like to go through the flow now? <span class="done">(recommended)</span></h3><ul class="flowextras"><li>Detailed duplicate comparison and mostly-empty warnings</li><li>Automatic icon matches and rename suggestions</li><li>Missing-icon guidance and low-resolution quality checks</li><li>A guided final review and change record</li></ul>');
+      const go=$('<button class="primary pclose">Go through the flow now (recommended)</button>');
+      go.onclick=async()=>{ go.disabled=true; close.disabled=true; cur.textContent='Syncing and rescanning your vault…'; try{ const next=await (await fetch('/api/reclassify',{method:'POST'})).json(); indexData(next); plan={icons:{},renames:{},urls:{},deletes:{},merges:{}}; visited={};committed=false;appMode='flow';cur=0;bg.remove();mount(); }catch{ go.disabled=false;close.disabled=false;cur.innerHTML='<span class="err">Rescan failed — you can close and run Favico again.</span>'; } };
+      pact.appendChild(go);
+    }
+    const close=$('<button class="pclose">'+(appMode==='editor'&&!nf?'No thanks — close Favico':'All done — close this window')+'</button>');
     close.onclick=()=>{ fetch('/api/quit',{method:'POST'}).catch(()=>{}); window.close(); setTimeout(()=>{ pact.innerHTML='<p class="hint">The tool has stopped — you can safely close this tab.</p>'; },350); };
     pact.appendChild(close);
   }
   try{
-    const resp=await fetch('/api/commit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({icons,renames,deletes,merges,report:consent.report,synonyms:pendingSynonyms})});
+    const resp=await fetch('/api/commit',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({icons,renames,urls,deletes,merges,report:consent.report,synonyms:pendingSynonyms})});
     if(!resp.body){ const r=await resp.json(); results=r.results; finishUp(); return; }
     const reader=resp.body.getReader(),dec=new TextDecoder(); let buf='';
     for(;;){ const {value,done}=await reader.read(); if(done) break; buf+=dec.decode(value,{stream:true});
@@ -989,8 +1323,8 @@ function openPicker(opts){
       </div>
 
       <div class="pane" data-pane="web" hidden>
-        <label class="fld">Step 1 — Type what to search the web for<span class="row-in"><input type="search" class="web-q" placeholder="e.g. Bunnings Warehouse"><button class="web-go">Search</button></span></label>
-        <p class="phint">👉 Step 2 — Click a result to select it (it highlights) and load it below to crop.</p>
+        <label class="fld">Step 1 — Search, paste an image URL, or paste a webpage URL<span class="row-in"><input type="search" class="web-q" placeholder="Brand name, image URL, or website URL"><button class="web-go">Find images</button></span></label>
+        <p class="phint">For a webpage URL, Favico shows the images found on that page. Then click one to load it below and crop.</p>
         <div class="grid web-results"></div>
       </div>
 
@@ -1001,8 +1335,8 @@ function openPicker(opts){
 
       <div class="crop-wrap" hidden>
         <div class="cropbox"><img></div>
-        <div class="zoomrow"><small>Zoom</small><input type="range" class="zoom" min="0.2" max="5" step="0.01" value="1"><button type="button" class="zreset">Reset</button></div>
-        <div class="bgrow"><span>Background:</span><div class="seg"><button type="button" class="bgopt on" data-bg="transparent">Transparent</button><button type="button" class="bgopt" data-bg="solid">Solid colour</button></div><input type="color" class="bgcolor" value="#ffffff" title="Background colour" hidden></div>
+        <div class="zoomrow"><small>Zoom</small><input type="range" class="zoom" min="0.2" max="10" step="0.01" value="1"><button type="button" class="zreset">Reset</button></div>
+        <div class="bgrow"><span>Background:</span><div class="seg"><button type="button" class="bgopt on" data-bg="transparent">Transparent</button><button type="button" class="bgopt" data-bg="solid">Solid colour</button></div><input type="color" class="bgcolor" value="#ffffff" title="Background colour" hidden><input type="text" class="hexcolor" value="#FFFFFF" maxlength="7" aria-label="Background hex colour" spellcheck="false" hidden></div>
         <div class="previews">\${SIZES.map(s=>\`<div style="text-align:center"><div class="p" style="width:\${s}px;height:\${s}px"><img></div><div style="font-size:10px;opacity:.6">\${s}px</div></div>\`).join('')}</div>
         <label class="fld">Save as <small>(library name — how it’s stored &amp; searchable by others)</small><input type="text" class="cname" placeholder="e.g. bunnings"></label>
       </div>
@@ -1012,7 +1346,7 @@ function openPicker(opts){
     document.body.appendChild(bg);
     const q1=(s)=>bg.querySelector(s);
     const cropWrap=q1('.crop-wrap'),box=q1('.cropbox'),img=q1('.cropbox img'),zoom=q1('.zoom'),nameI=q1('.cname'),err=q1('.cerr'),pimgs=[...bg.querySelectorAll('.previews .p img')];
-    const bgOpts=[...bg.querySelectorAll('.bgopt')],bgColor=q1('.bgcolor'),pPanels=[...bg.querySelectorAll('.previews .p')];
+    const bgOpts=[...bg.querySelectorAll('.bgopt')],bgColor=q1('.bgcolor'),hexColor=q1('.hexcolor'),pPanels=[...bg.querySelectorAll('.previews .p')];
     let bgMode='transparent';
     const libQ=q1('.lib-q'),libRes=q1('.lib-results'),webQ=q1('.web-q'),webGo=q1('.web-go'),webRes=q1('.web-results'),upFile=q1('.up-file');
     let mode='library', libPick=null, iw=0,ih=0,z=1,ox=0,oy=0,drag=null,objUrl=null;
@@ -1038,9 +1372,12 @@ function openPicker(opts){
     box.onpointerup=()=>{drag=null;};
     function applyBg(el){ if(bgMode==='transparent'){ el.classList.add('checker'); el.style.backgroundColor=''; } else { el.classList.remove('checker'); el.style.backgroundColor=bgColor.value; } }
     function updateBg(){ applyBg(box); pPanels.forEach(applyBg); }
-    function selectBg(m){ bgMode=m; bgOpts.forEach(b=>b.classList.toggle('on',b.dataset.bg===m)); bgColor.hidden=(m!=='solid'); updateBg(); }
+    function selectBg(m){ bgMode=m; bgOpts.forEach(b=>b.classList.toggle('on',b.dataset.bg===m)); bgColor.hidden=(m!=='solid'); hexColor.hidden=(m!=='solid'); updateBg(); }
     bgOpts.forEach(b=>b.onclick=()=>selectBg(b.dataset.bg));
-    bgColor.oninput=()=>{ selectBg('solid'); };
+    bgColor.oninput=()=>{ hexColor.value=bgColor.value.toUpperCase(); selectBg('solid'); };
+    function applyHex(){ let value=hexColor.value.trim(); if(/^[0-9a-f]{3}$/i.test(value))value='#'+value; if(/^#[0-9a-f]{3}$/i.test(value))value='#'+value.slice(1).split('').map(c=>c+c).join(''); if(!/^#[0-9a-f]{6}$/i.test(value)){ hexColor.setCustomValidity('Enter #RGB or #RRGGBB'); return; } hexColor.setCustomValidity(''); value=value.toUpperCase(); hexColor.value=value; bgColor.value=value; selectBg('solid'); }
+    hexColor.oninput=()=>{ hexColor.setCustomValidity(''); if(/^#?[0-9a-f]{3}(?:[0-9a-f]{3})?$/i.test(hexColor.value.trim()))applyHex(); };
+    hexColor.onchange=applyHex;
     selectBg('transparent');
 
     // tabs
@@ -1066,13 +1403,18 @@ function openPicker(opts){
       }catch{ libRes.innerHTML='<small class="err">search failed</small>'; } },300); }
     libQ.oninput=libSearch;
 
-    // web search
-    async function webSearch(){ const q=webQ.value.trim(); if(q.length<2){err.textContent='Type something to search for first.';return;} err.textContent=''; webRes.innerHTML='<small>searching…</small>';
-      try{ const d=await (await fetch(FAVICO+'/api/imagesearch?q='+encodeURIComponent(q))).json(); webRes.innerHTML='';
-        (d.results||[]).forEach(r=>{ const b=$('<button class="ic" title="'+esc(r.title||r.source||'')+'"><img></button>'); const im=b.querySelector('img'); im.onerror=()=>b.remove(); im.src=r.url;
-          b.onclick=()=>{ webRes.querySelectorAll('.ic').forEach(x=>x.classList.remove('sel')); b.classList.add('sel'); if(!nameTouched) nameI.value=q.toLowerCase().replace(/[^a-z0-9-]/g,'').slice(0,63); loadUrl(r.url); }; webRes.appendChild(b); });
-        if(!webRes.children.length) webRes.innerHTML='<small>no results</small>';
-      }catch{ webRes.innerHTML='<small class="err">search failed</small>'; } }
+    // web search, direct image URL, or webpage image discovery
+    async function webSearch(){ const q=webQ.value.trim(); if(q.length<2){err.textContent='Enter a search term, image URL, or webpage URL first.';return;} err.textContent=''; webRes.innerHTML='<small>finding images…</small>';
+      const isUrl=/^(?:https:\\/\\/|www\\.)/i.test(q);
+      const endpoint=isUrl?FAVICO+'/api/pageimages?url='+encodeURIComponent(q):FAVICO+'/api/imagesearch?q='+encodeURIComponent(q);
+      try{ const response=await fetch(endpoint); const d=await response.json(); webRes.innerHTML='';
+        if(!response.ok){ webRes.innerHTML='<small class="err">'+esc(d.error||'could not read that URL')+'</small>'; return; }
+        let suggested=q;
+        if(isUrl){ try{ suggested=new URL(/^https:\\/\\//i.test(q)?q:'https://'+q).hostname.replace(/^www\\./,'').split('.')[0]; }catch{} }
+        (d.results||[]).forEach(r=>{ const b=$('<button class="ic" title="'+esc(r.title||r.source||'')+'"><img></button>'); const im=b.querySelector('img'); im.onerror=()=>b.remove(); im.src=FAVICO+'/api/imageproxy?url='+encodeURIComponent(r.url);
+          b.onclick=()=>{ webRes.querySelectorAll('.ic').forEach(x=>x.classList.remove('sel')); b.classList.add('sel'); if(!nameTouched) nameI.value=suggested.toLowerCase().replace(/[^a-z0-9-]/g,'').slice(0,63); loadUrl(r.url); }; webRes.appendChild(b); });
+        if(!webRes.children.length) webRes.innerHTML='<small>no usable images found</small>';
+      }catch{ webRes.innerHTML='<small class="err">image lookup failed</small>'; } }
     webGo.onclick=webSearch; webQ.onkeydown=(e)=>{ if(e.key==='Enter'){e.preventDefault();webSearch();} };
 
     // upload
@@ -1108,7 +1450,8 @@ function iconRow(e, opts){
   opts=opts||{};
   const hasInitial=opts.cand||(opts.current&&e.iconUrl);
   const label=hasInitial?'Select a different icon…':'Choose an icon…';
-  const row=$(\`<div class="row" data-id="\${e.id}"><input type="checkbox" class="cpick"><span class="iconcell"></span><div class="grow"><div class="name">\${esc(e.name)}</div><div class="host">\${esc(e.host||'no web URL')}</div></div><button class="change">\${label}</button><span class="state"></span></div>\`);
+  const detail=opts.showResolution&&e.width&&e.height?\`\${e.host||'no web URL'} · \${e.width}×\${e.height}px\`:(e.host||'no web URL');
+  const row=$(\`<div class="row" data-id="\${e.id}"><input type="checkbox" class="cpick"><span class="iconcell"></span><div class="grow"><div class="name">\${esc(e.name)}</div><div class="host">\${esc(detail)}</div></div><button class="change">\${label}</button><span class="state"></span></div>\`);
   const cb=row.querySelector('.cpick'), cell=row.querySelector('.iconcell'), state=row.querySelector('.state');
   // No brand-name guessing: prefill the picker only when this row already has a
   // confirmed favico name (e.g. a Section 1 match). Otherwise leave the fields blank.
@@ -1165,6 +1508,7 @@ function listenOn(port, triesLeft) {
 
 async function main() {
   if (!SESSION) { console.error("Set BW_SESSION first:  export BW_SESSION=$(bw unlock --raw)"); process.exit(1); }
+  assertWorkingSpace();
   try { bw(["--version"]); } catch { console.error("Bitwarden CLI not found. Install: npm i -g @bitwarden/cli"); process.exit(1); }
 
   // confirm the session actually unlocked (a wrong master password leaves it locked / the var empty)
@@ -1178,6 +1522,7 @@ async function main() {
     console.error("    Re-run:  $env:BW_SESSION = bw unlock --raw   (then start this again)\n");
     process.exit(1);
   }
+  VAULT_WEB = vaultWebUrl(st.serverUrl);
   console.error(`  ✓ favico v${VERSION} — vault unlocked for ${st.userEmail} on ${serverLabel(st.serverUrl)}`);
 
   if (process.argv.includes("--no-backup")) {
@@ -1222,6 +1567,7 @@ async function main() {
   console.error(`     Section 1 (no icon, matched): ${SECTIONS.s1.length}`);
   console.error(`     Section 2 (no icon, no match): ${SECTIONS.s2.length}`);
   console.error(`     Section 3 (has icon): ${SECTIONS.s3.length}`);
+  console.error(`     Low-resolution icons (47×47 or smaller): ${SECTIONS.quality.length}`);
   console.error(`     Suggested renames: ${SECTIONS.renames.length}   Duplicate groups: ${SECTIONS.dups.length}`);
   listenOn(PORT, 20);
 }
@@ -1233,4 +1579,4 @@ if (isMain) {
   });
 }
 
-export { inspectIcon, probeBitwardenIconService };
+export { duplicateComparison, HTML, imageDimensions, inspectIcon, needsQualityImprovement, probeBitwardenIconService, safeBwError, validLoginUri };

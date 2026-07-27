@@ -40,16 +40,16 @@ Along the way it can also suggest cleaner entry names and flag likely-duplicate 
 ## Get it
 
 **Easiest — download the ZIP (no tools needed):** on this
-[GitHub page](https://github.com/zacaracaz/favico-app), click the green
+[GitHub page](https://github.com/zacaracaz/favico), click the green
 **`<> Code`** button → **Download ZIP**, then unzip it.
 
-Then open the folder and follow **Run it** below.
+Then open the folder and run `start.cmd` — it will do the rest.
 
 > Tips: on Windows a freshly-downloaded `start.cmd` may trigger SmartScreen —
 > click *More info → Run anyway*. On macOS/Linux from a ZIP, launch with
 > `bash start.sh` (a ZIP drops the file's executable bit).
 
-## Run it
+## Running it
 
 The only thing you must already have is a **Bitwarden account** — the launcher
 offers to install everything else it needs:
@@ -79,12 +79,33 @@ If you'd rather install the prerequisites yourself: Node.js from
 
 ## What the wizard does
 
-1. **Matched** — entries with no icon that auto-matched (pre-selected).
-2. **Pick icons** — no match: search the library, search the web, or upload one.
-3. **Replace** — optionally swap an entry's existing icon.
-4. **Rename** — cleaner names for URL/package-style entries.
-5. **Duplicates** — logins grouped by site + username; tick any to move to Trash.
-6. **Review & apply** — full summary + a downloadable change record, then apply.
+Start by choosing:
+
+- **Go through the flow (recommended)** — the guided experience with automatic
+  matching, detailed duplicate comparison, mostly-empty duplicate warnings,
+  rename suggestions, unresolved-icon help, low-resolution icon detection,
+  optional replacement, a final review and a downloadable change record.
+- **Editor Mode** — a manual list of every login where you can directly change
+  its name, 48×48 icon or web addresses. After saving, Favico offers to take you
+  through the recommended flow for its extra checks and suggestions.
+
+The guided flow is:
+
+1. **Options** — choose whether local password comparison and anonymous hints
+   are allowed.
+2. **Duplicates** — see exactly what differs, flag mostly-empty copies, and
+   choose **Keep this one**; every other copy only moves to recoverable Trash.
+3. **Matched** — review confident automatic icon matches before rename.
+4. **Rename** — review cleaner names for URL/package-style entries.
+5. **Pick icons** — search the library or web, enter a direct image URL, extract
+   images from a webpage URL, or upload/paste an image.
+6. **Improve quality** — replace existing icons measuring 47×47 pixels or less.
+7. **Replace** — optionally swap any other entry's existing icon.
+8. **Review & apply** — see the full summary, download a change record, then
+   apply.
+
+The image editor shows icons at 48×48 throughout, supports up to 10× zoom, and
+accepts both a visual background-colour choice and an exact hex code.
 
 Nothing is written to your vault until the final **Apply** step.
 
