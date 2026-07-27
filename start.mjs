@@ -121,7 +121,6 @@ async function main() {
   console.log(bold("\n  Step 3 of 4 — Unlock your vault"));
   let session = "";
   for (let i = 0; i < 3 && !session; i++) {
-    console.log("  Type your master password (it stays hidden as you type):");
     session = (bwUnlockRaw().stdout || "").trim();
     if (!session) fail("Wrong master password or cancelled." + (i < 2 ? " Try again." : ""));
   }
