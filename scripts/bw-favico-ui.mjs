@@ -22,6 +22,7 @@ import { execFileSync, spawn } from "child_process";
 import { mkdirSync } from "fs";
 import path from "path";
 import crypto from "crypto";
+import { fileURLToPath } from "url";
 
 // Silence the Bitwarden CLI's noisy "punycode is deprecated" warning. bw is a
 // Node app, so it inherits this and drops the DeprecationWarning lines.
@@ -33,7 +34,7 @@ const FAVICO = "https://www.favico.app";
 const ROOT = "favico.app";
 const BW_ICONS = "https://icons.bitwarden.net";
 const MATCH_NEVER = 5;
-const VERSION = "2.0.0";
+const VERSION = "2.0.1";
 // Per-run token: the served page carries it and every /api call must echo it.
 // Stops a random website (or DNS rebinding) from driving the local server.
 const UI_TOKEN = crypto.randomBytes(18).toString("hex");
@@ -88,7 +89,40 @@ const slug = (s) => { const v = (s||"").toLowerCase().replace(/[^a-z0-9-]+/g,"-"
 // Node's fetch has no default timeout — one slow/blackholed host could stall the
 // scan for minutes (the "stuck at 99%" tail). Cap every icon-service request.
 const FETCH_TIMEOUT = 8000;
-async function hashUrl(url) { try { const r = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(FETCH_TIMEOUT) }); if (!r.ok) return null; return crypto.createHash("sha1").update(Buffer.from(await r.arrayBuffer())).digest("hex"); } catch { return null; } }
+async function inspectIcon(url) {
+  try {
+    const r = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(FETCH_TIMEOUT) });
+    if (r.ok) {
+      const hash = crypto.createHash("sha1").update(Buffer.from(await r.arrayBuffer())).digest("hex");
+      return { kind: "icon", hash, status: r.status };
+    }
+    // Bitwarden historically returned a fixed placeholder image for missing
+    // icons, but now also returns 404/503. A known-icon health probe below
+    // distinguishes the new missing response from a real service outage.
+    if (r.status === 404 || r.status === 503) return { kind: "missing", hash: null, status: r.status };
+    return { kind: "unavailable", hash: null, status: r.status };
+  } catch {
+    return { kind: "unavailable", hash: null, status: null };
+  }
+}
+async function probeBitwardenIconService(requestIcon = inspectIcon) {
+  const health = await requestIcon(`${BW_ICONS}/google.com/icon.png`);
+  if (health.kind !== "icon") {
+    throw new Error("Bitwarden's icon service is unavailable. Your vault was not changed; please try again later.");
+  }
+
+  const defaultHashes = new Set();
+  let missingResponses = 0;
+  for (const host of ["zzqq-no-such-9988.com", "qx7-nonexistent-brand-22.com", "example.com"]) {
+    const result = await requestIcon(`${BW_ICONS}/${host}/icon.png`);
+    if (result.kind === "icon") defaultHashes.add(result.hash);
+    else if (result.kind === "missing") missingResponses++;
+  }
+  if (!defaultHashes.size && !missingResponses) {
+    throw new Error("Bitwarden's icon service could not confirm missing icons. Your vault was not changed; please try again later.");
+  }
+  return defaultHashes;
+}
 async function favicoExists(name) { try { const r = await fetch(`${FAVICO}/api/icons?subdomain=${encodeURIComponent(name)}`, { signal: AbortSignal.timeout(FETCH_TIMEOUT) }); return !!(await r.json()).exists; } catch { return false; } }
 async function pool(items, n, w) { let i = 0; await Promise.all(Array.from({ length: n }, async () => { while (i < items.length) await w(items[i++]); })); }
 
@@ -174,14 +208,10 @@ async function classify(onProgress) {
   byId.clear();
   for (const it of logins) byId.set(it.id, it);
 
-  // Bitwarden returns a fixed placeholder for any domain with no favicon.
-  // Capture its hash from several known no-favicon domains (robust to a flaky fetch).
-  const defaultHashes = new Set();
-  for (const s of ["zzqq-no-such-9988.com", "qx7-nonexistent-brand-22.com", "example.com"]) {
-    const hh = await hashUrl(`${BW_ICONS}/${s}/icon.png`);
-    if (hh) defaultHashes.add(hh);
-  }
-  if (!defaultHashes.size) { console.error("Could not reach icons.bitwarden.net"); process.exit(1); }
+  // Confirm a known icon works before treating Bitwarden's 404/503 response as
+  // a missing icon. Older deployments return a placeholder image instead, so
+  // retain its hash when present.
+  const defaultHashes = await probeBitwardenIconService();
 
   // Download community hints once (public, aggregated — nothing is sent). Used both
   // to auto-match icons (host → icon) and to improve rename suggestions below.
@@ -202,10 +232,12 @@ async function classify(onProgress) {
    try {
     const host = it.login.uris.map((u) => hostOf(u.uri)).find(Boolean) || null;
     const already = host && (host === ROOT || host.endsWith(`.${ROOT}`));
-    const h = host ? await hashUrl(`${BW_ICONS}/${host}/icon.png`) : null;
-    // has a real icon only if we got bytes that aren't the placeholder;
-    // a failed fetch counts as "no icon" so it lands in section 1/2 (actionable)
-    const hasIcon = already || (h !== null && !defaultHashes.has(h));
+    const icon = host ? await inspectIcon(`${BW_ICONS}/${host}/icon.png`) : { kind: "missing", hash: null };
+    // Only a confirmed missing response is actionable. Unexpected per-host
+    // failures are left alone so a transient error cannot trigger bad edits.
+    const hasIcon = already
+      || icon.kind === "unavailable"
+      || (icon.kind === "icon" && !defaultHashes.has(icon.hash));
     if (hasIcon) {
       s3.push({ id: it.id, name: it.name || "(no name)", host, iconUrl: host ? `${BW_ICONS}/${host}/icon.png` : null });
       return;
@@ -1193,4 +1225,12 @@ async function main() {
   console.error(`     Suggested renames: ${SECTIONS.renames.length}   Duplicate groups: ${SECTIONS.dups.length}`);
   listenOn(PORT, 20);
 }
-main().catch((e) => { console.error("FATAL:", e.message); process.exit(1); });
+const isMain = process.argv[1] && path.resolve(process.argv[1]) === fileURLToPath(import.meta.url);
+if (isMain) {
+  main().catch((e) => {
+    console.error(`\n  ✗ ${e.message}\n`);
+    process.exitCode = 1;
+  });
+}
+
+export { inspectIcon, probeBitwardenIconService };
