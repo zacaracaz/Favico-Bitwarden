@@ -43,12 +43,6 @@ Along the way it can also suggest cleaner entry names and flag likely-duplicate 
 [GitHub page](https://github.com/zacaracaz/favico-app), click the green
 **`<> Code`** button → **Download ZIP**, then unzip it.
 
-**Or clone it (if you have git):**
-
-```bash
-git clone https://github.com/zacaracaz/favico-app.git
-```
-
 Then open the folder and follow **Run it** below.
 
 > Tips: on Windows a freshly-downloaded `start.cmd` may trigger SmartScreen —
