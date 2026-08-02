@@ -37,6 +37,15 @@ Nothing else about the entry changes, and it's reversible anytime — the wizard
 
 Along the way it can also suggest cleaner entry names and flag likely-duplicate logins.
 
+## Platform support
+
+- **Windows is the supported and tested platform today.** Use `start.cmd` for
+  the guided setup.
+- **macOS and Linux support is experimental.** A dedicated `start.sh` launcher
+  and cross-platform Node paths are included and are expected to work, but the
+  complete journey has not yet been verified on either platform. Use
+  `bash start.sh` from a downloaded ZIP and please report anything that fails.
+
 ## Get it
 
 **Easiest — download the ZIP (no tools needed):** on this
