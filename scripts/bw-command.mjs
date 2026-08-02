@@ -7,6 +7,25 @@ export const BW_DOWNLOAD_URLS = Object.freeze({
   linux: "https://bitwarden.com/download/?app=cli&platform=linux",
 });
 
+export const BITWARDEN_SERVERS = Object.freeze({
+  us: "https://vault.bitwarden.com",
+  eu: "https://vault.bitwarden.eu",
+});
+
+export function loginArgs(method) {
+  if (method === "sso") return ["login", "--sso"];
+  if (method === "apikey") return ["login", "--apikey"];
+  return ["login"];
+}
+
+export function validServerUrl(value) {
+  try {
+    return ["http:", "https:"].includes(new URL(value).protocol);
+  } catch {
+    return false;
+  }
+}
+
 export function bundledBwPath(root, platform = process.platform) {
   return path.join(root, ".favico-runtime", platform === "win32" ? "bw.exe" : "bw");
 }

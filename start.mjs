@@ -20,7 +20,14 @@ import { createInterface } from "readline/promises";
 import { stdin, stdout } from "process";
 import path from "path";
 import { fileURLToPath } from "url";
-import { bitwardenDownloadUrl, bundledBwPath, bwInvocation } from "./scripts/bw-command.mjs";
+import {
+  BITWARDEN_SERVERS,
+  bitwardenDownloadUrl,
+  bundledBwPath,
+  bwInvocation,
+  loginArgs,
+  validServerUrl,
+} from "./scripts/bw-command.mjs";
 
 // Silence the Bitwarden CLI's "punycode is deprecated" warning in every bw child.
 process.env.NODE_OPTIONS = [process.env.NODE_OPTIONS, "--no-deprecation"].filter(Boolean).join(" ");
@@ -123,6 +130,64 @@ const rl = createInterface({ input: stdin, output: stdout });
 const ask = async (q) => (await rl.question(q)).trim();
 const askYes = async (q) => /^y(es)?$/i.test(await ask(q + dim(" [y/N] ")));
 
+async function chooseServer(currentUrl) {
+  console.log("\n    Where is this Bitwarden account?");
+  console.log("      1. bitwarden.com (US)");
+  console.log("      2. bitwarden.eu (EU)");
+  console.log("      3. A self-hosted Bitwarden/Vaultwarden server");
+  const choice = await ask(dim("    Choose 1, 2 or 3 [1]: ")) || "1";
+  if (choice === "2") return BITWARDEN_SERVERS.eu;
+  if (choice === "3") {
+    const custom = await ask(dim("    Enter the full server URL (for example https://vault.example.com): "));
+    if (!validServerUrl(custom)) {
+      warn("That is not a valid http/https server URL.");
+      return null;
+    }
+    return custom.replace(/\/$/, "");
+  }
+  if (choice !== "1") warn("Choice not recognised; using bitwarden.com (US).");
+  return BITWARDEN_SERVERS.us;
+}
+
+async function chooseLoginCommand() {
+  console.log("\n    How do you sign in?");
+  console.log("      1. Email and master password (recommended)");
+  console.log("      2. Single sign-on (SSO)");
+  console.log("      3. Personal API key (for FIDO2, Duo, or a bot-challenge message)");
+  const choice = await ask(dim("    Choose 1, 2 or 3 [1]: ")) || "1";
+  if (choice === "2") return loginArgs("sso");
+  if (choice === "3") return loginArgs("apikey");
+  if (choice !== "1") warn("Choice not recognised; using email and master password.");
+  return loginArgs("password");
+}
+
+async function loginToBitwarden(initialStatus) {
+  let status = initialStatus;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    const server = await chooseServer(status?.serverUrl);
+    if (!server) {
+      if (attempt < 3 && await askYes("    Try choosing the server again?")) continue;
+      return status;
+    }
+    info(`Connecting this private CLI to ${serverLabel(server)}…`);
+    const configured = bwInherit(["config", "server", server]);
+    if (configured.status !== 0) {
+      warn("Bitwarden could not save that server setting.");
+    } else {
+      const command = await chooseLoginCommand();
+      console.log(dim("    Favico does not read or store anything entered into Bitwarden's prompts.\n"));
+      bwInherit(command);
+      status = bwStatus();
+      if (status && status.status !== "unauthenticated") return status;
+      warn("Bitwarden still reports this CLI as logged out.");
+      console.log(dim("    Check the selected US/EU/self-hosted server and the message Bitwarden printed above."));
+      console.log(dim("    FIDO2 and Duo accounts need the Personal API key option; SSO accounts need SSO."));
+    }
+    if (attempt >= 3 || !await askYes("    Try another server or sign-in method now?")) return status;
+  }
+  return status;
+}
+
 async function main() {
   console.log(bold("\n  favico × Bitwarden — guided setup\n"));
   console.log("  Bitwarden shows the favicon of the site each login points at — but many");
@@ -160,11 +225,12 @@ async function main() {
   console.log(bold("\n  Step 2 of 4 — Bitwarden account"));
   let st = bwStatus();
   if (!st || st.status === "unauthenticated") {
-    info("You're not logged in. Starting Bitwarden login…");
-    console.log(dim("    (email, master password, and your 2FA code if enabled)\n"));
-    bwInherit(["login"]);
-    st = bwStatus();
-    if (!st || st.status === "unauthenticated") { fail("Login didn't complete. Re-run when you're ready."); process.exit(1); }
+    info("You're not logged in. Let's select the correct account server and sign-in method.");
+    st = await loginToBitwarden(st);
+    if (!st || st.status === "unauthenticated") {
+      fail("Bitwarden is still logged out. The exact Bitwarden message above identifies the remaining account-side issue.");
+      process.exit(1);
+    }
   }
   ok(`Logged in as ${st.userEmail || "(your account)"} on ${serverLabel(st.serverUrl)}`);
 

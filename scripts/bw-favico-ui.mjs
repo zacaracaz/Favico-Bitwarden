@@ -35,7 +35,7 @@ const FAVICO = "https://www.favico.app";
 const ROOT = "favico.app";
 const BW_ICONS = "https://icons.bitwarden.net";
 const MATCH_NEVER = 5;
-const VERSION = "2.1.1";
+const VERSION = "2.1.2";
 // Per-run token: the served page carries it and every /api call must echo it.
 // Stops a random website (or DNS rebinding) from driving the local server.
 const UI_TOKEN = crypto.randomBytes(18).toString("hex");

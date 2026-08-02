@@ -79,9 +79,10 @@ Then just:
 - **Any OS (Node already installed):** `node start.mjs`
 
 The launcher walks you through everything, narrating each step: installs/checks
-prerequisites, logs you in only if needed, unlocks your vault (your master
-password stays hidden), makes an **encrypted backup**, and opens a 6-step wizard
-in your browser.
+prerequisites, asks whether your account is on the US, EU or a self-hosted
+server, offers password, SSO and personal-API-key sign-in through Bitwarden's
+own private prompts, unlocks your vault (your master password stays hidden),
+makes an **encrypted backup**, and opens a 6-step wizard in your browser.
 
 > On Windows, the very first run after a fresh Node install may say *"Node was
 > installed but this window needs reopening"* — just close it and double-click
