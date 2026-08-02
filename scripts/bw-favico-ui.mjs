@@ -11,7 +11,7 @@
  * existing URIs down, so Bitwarden shows that icon but autofill is unaffected.
  *
  * Run:
- *   npm i -g @bitwarden/cli
+ *   Install the Bitwarden CLI from https://bitwarden.com/help/cli/
  *   bw login && export BW_SESSION=$(bw unlock --raw)
  *   # (the tool also auto-creates an ENCRYPTED backup on launch — see backups/)
  *   # optional: set BW_BACKUP_PASSWORD for a portable password-protected backup
@@ -23,6 +23,7 @@ import { mkdirSync, statfsSync } from "fs";
 import path from "path";
 import crypto from "crypto";
 import { fileURLToPath } from "url";
+import { bwInvocation } from "./bw-command.mjs";
 
 // Silence the Bitwarden CLI's noisy "punycode is deprecated" warning. bw is a
 // Node app, so it inherits this and drops the DeprecationWarning lines.
@@ -34,7 +35,7 @@ const FAVICO = "https://www.favico.app";
 const ROOT = "favico.app";
 const BW_ICONS = "https://icons.bitwarden.net";
 const MATCH_NEVER = 5;
-const VERSION = "2.1.0";
+const VERSION = "2.1.1";
 // Per-run token: the served page carries it and every /api call must echo it.
 // Stops a random website (or DNS rebinding) from driving the local server.
 const UI_TOKEN = crypto.randomBytes(18).toString("hex");
@@ -60,7 +61,6 @@ const ICON_SVG = `<svg id="Layer_1" xmlns="http://www.w3.org/2000/svg" version="
   <path class="st0" d="M541.13,275.09l-81.16-33.25c-16.45-6.74-34.48,5.36-34.48,23.13v66.51c0,17.78,18.03,29.87,34.48,23.13l81.16-33.25c20.7-8.48,20.7-37.79,0-46.27Z"/>
 </svg>`;
 
-const isWin = process.platform === "win32";
 const MIN_FREE_BYTES = 250 * 1024 * 1024;
 function diskFullError(target) {
   const root = path.parse(path.resolve(target)).root || target;
@@ -91,12 +91,11 @@ function safeBwError(error, operation) {
   safe.code = "BW_COMMAND_FAILED";
   return safe;
 }
-// On Windows the CLI is bw.cmd/bw.ps1; spawn it through cmd so PATHEXT resolves
-// it and Node's .cmd-spawn restriction doesn't bite.
 function runBw(args, opts) {
   const a = [...args, ...(SESSION ? ["--session", SESSION] : [])];
+  const command = bwInvocation(a);
   try {
-    return isWin ? execFileSync("cmd", ["/c", "bw", ...a], opts) : execFileSync("bw", a, opts);
+    return execFileSync(command.file, command.args, opts);
   } catch (error) {
     throw safeBwError(error, args[0] || "requested");
   }
@@ -1509,7 +1508,7 @@ function listenOn(port, triesLeft) {
 async function main() {
   if (!SESSION) { console.error("Set BW_SESSION first:  export BW_SESSION=$(bw unlock --raw)"); process.exit(1); }
   assertWorkingSpace();
-  try { bw(["--version"]); } catch { console.error("Bitwarden CLI not found. Install: npm i -g @bitwarden/cli"); process.exit(1); }
+  try { bw(["--version"]); } catch { console.error("Bitwarden CLI not found. Start this tool through start.mjs, or install it from https://bitwarden.com/help/cli/."); process.exit(1); }
 
   // confirm the session actually unlocked (a wrong master password leaves it locked / the var empty)
   let st;

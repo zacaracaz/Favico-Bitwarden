@@ -45,6 +45,8 @@ Along the way it can also suggest cleaner entry names and flag likely-duplicate 
   and cross-platform Node paths are included and are expected to work, but the
   complete journey has not yet been verified on either platform. Use
   `bash start.sh` from a downloaded ZIP and please report anything that fails.
+  The Debian prerequisite path avoids global npm installs and does not require
+  Favico to run as root.
 
 ## Get it
 
@@ -66,7 +68,9 @@ offers to install everything else it needs:
 - **Node.js** — if it's missing, the wrapper installs it for you: `start.cmd`
   uses **winget** (Windows); `start.sh` uses **Homebrew / apt / dnf / pacman**
   (macOS/Linux). Each asks first.
-- **Bitwarden CLI** — `start.mjs` offers to install it via **npm** if missing.
+- **Bitwarden CLI** — `start.mjs` offers to download Bitwarden's official,
+  dependency-free executable into a private `.favico-runtime` folder. It does
+  not change the system installation or need `sudo`/Administrator access.
 
 Then just:
 
@@ -84,7 +88,8 @@ in your browser.
 > `start.cmd` again (a one-time PATH refresh).
 
 If you'd rather install the prerequisites yourself: Node.js from
-<https://nodejs.org>, then `npm install -g @bitwarden/cli`.
+<https://nodejs.org>, then the native Bitwarden CLI from
+<https://bitwarden.com/help/cli/>.
 
 ## What the wizard does
 

@@ -15,10 +15,12 @@
  * (Windows users can double-click start.cmd; macOS/Linux can run ./start.sh)
  */
 import { spawnSync } from "child_process";
+import { chmodSync, existsSync, mkdirSync, rmSync, writeFileSync } from "fs";
 import { createInterface } from "readline/promises";
 import { stdin, stdout } from "process";
 import path from "path";
 import { fileURLToPath } from "url";
+import { bitwardenDownloadUrl, bundledBwPath, bwInvocation } from "./scripts/bw-command.mjs";
 
 // Silence the Bitwarden CLI's "punycode is deprecated" warning in every bw child.
 process.env.NODE_OPTIONS = [process.env.NODE_OPTIONS, "--no-deprecation"].filter(Boolean).join(" ");
@@ -26,6 +28,8 @@ process.env.NODE_OPTIONS = [process.env.NODE_OPTIONS, "--no-deprecation"].filter
 const isWin = process.platform === "win32";
 const here = path.dirname(fileURLToPath(import.meta.url));
 const UI = path.join(here, "scripts", "bw-favico-ui.mjs");
+const LOCAL_BW = bundledBwPath(here);
+let activeBwPath = existsSync(LOCAL_BW) ? LOCAL_BW : "";
 
 // ── tiny ANSI helpers ────────────────────────────────────────────────
 const sgr = (n, s) => `\x1b[${n}m${s}\x1b[0m`;
@@ -36,25 +40,69 @@ const info = (s) => console.log("  " + cyan("•") + " " + s);
 const warn = (s) => console.log("  " + yellow("•") + " " + s);
 const fail = (s) => console.log("  " + red("✗") + " " + s);
 
-// On Windows the CLI is bw.cmd; run it through cmd so PATHEXT resolves it and
-// Node's .cmd-spawn restriction doesn't bite. node/npm handled directly.
+function runBw(args, options) {
+  const command = bwInvocation(args, { localPath: activeBwPath });
+  return spawnSync(command.file, command.args, options);
+}
 function bwCapture(args) {
-  return isWin ? spawnSync("cmd", ["/c", "bw", ...args], { encoding: "utf8" })
-               : spawnSync("bw", args, { encoding: "utf8" });
+  return runBw(args, { encoding: "utf8" });
 }
 function bwInherit(args) {
-  return isWin ? spawnSync("cmd", ["/c", "bw", ...args], { stdio: "inherit" })
-               : spawnSync("bw", args, { stdio: "inherit" });
+  return runBw(args, { stdio: "inherit" });
 }
 // interactive prompt on stderr, typed password on stdin, raw session on stdout
 function bwUnlockRaw() {
   const opt = { stdio: ["inherit", "pipe", "inherit"], encoding: "utf8" };
-  return isWin ? spawnSync("cmd", ["/c", "bw", "unlock", "--raw"], opt)
-               : spawnSync("bw", ["unlock", "--raw"], opt);
+  return runBw(["unlock", "--raw"], opt);
 }
-function npmInstallCli() {
-  return isWin ? spawnSync("cmd", ["/c", "npm", "i", "-g", "@bitwarden/cli"], { stdio: "inherit" })
-               : spawnSync("npm", ["i", "-g", "@bitwarden/cli"], { stdio: "inherit" });
+
+function extractCli(zipPath, runtimeDir) {
+  if (isWin) {
+    return spawnSync("powershell.exe", [
+      "-NoProfile",
+      "-NonInteractive",
+      "-Command",
+      "Expand-Archive -LiteralPath $env:FAVICO_BW_ZIP -DestinationPath $env:FAVICO_BW_RUNTIME -Force",
+    ], {
+      stdio: "ignore",
+      env: { ...process.env, FAVICO_BW_ZIP: zipPath, FAVICO_BW_RUNTIME: runtimeDir },
+    }).status === 0;
+  }
+  const attempts = [
+    ...(process.platform === "darwin" ? [["ditto", ["-x", "-k", zipPath, runtimeDir]]] : []),
+    ["unzip", ["-oq", zipPath, "-d", runtimeDir]],
+    ["python3", ["-m", "zipfile", "-e", zipPath, runtimeDir]],
+  ];
+  return attempts.some(([file, args]) => spawnSync(file, args, { stdio: "ignore" }).status === 0);
+}
+
+async function installBundledCli() {
+  const url = bitwardenDownloadUrl();
+  if (!url) {
+    fail(`Automatic Bitwarden setup is not yet available for ${process.platform}/${process.arch}.`);
+    return false;
+  }
+
+  const runtimeDir = path.dirname(LOCAL_BW);
+  const zipPath = path.join(runtimeDir, "bitwarden-cli.zip");
+  mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
+  try {
+    const response = await fetch(url, { redirect: "follow", signal: AbortSignal.timeout(120_000) });
+    if (!response.ok) throw new Error(`download returned HTTP ${response.status}`);
+    writeFileSync(zipPath, Buffer.from(await response.arrayBuffer()), { mode: 0o600 });
+    if (!extractCli(zipPath, runtimeDir) || !existsSync(LOCAL_BW)) {
+      throw new Error("the downloaded archive could not be unpacked");
+    }
+    if (!isWin) chmodSync(LOCAL_BW, 0o700);
+    activeBwPath = LOCAL_BW;
+    process.env.FAVICO_BW_PATH = LOCAL_BW;
+    return true;
+  } catch (error) {
+    fail(`Bitwarden CLI installation failed: ${error?.message || "unknown error"}`);
+    return false;
+  } finally {
+    rmSync(zipPath, { force: true });
+  }
 }
 function bwStatus() {
   const r = bwCapture(["status"]);
@@ -95,13 +143,16 @@ async function main() {
 
   let ver = bwCapture(["--version"]);
   if (ver.status !== 0) {
-    warn("Bitwarden CLI (bw) is not installed.");
-    if (await askYes("    Install it now with npm?")) {
-      info("Installing @bitwarden/cli globally…");
-      npmInstallCli();
+    warn("A working Bitwarden CLI (bw) was not found.");
+    if (await askYes("    Download Bitwarden's official standalone CLI for Favico?")) {
+      info("Downloading the dependency-free Bitwarden CLI into Favico's private folder…");
+      await installBundledCli();
       ver = bwCapture(["--version"]);
     }
-    if (ver.status !== 0) { fail("Still not found. Install it manually, then re-run:  npm i -g @bitwarden/cli"); process.exit(1); }
+    if (ver.status !== 0) {
+      fail("Bitwarden CLI is still unavailable. Re-run and approve the private download, or install bw from bitwarden.com/help/cli/.");
+      process.exit(1);
+    }
   }
   ok(`Bitwarden CLI ${(ver.stdout || "").trim()}`);
 
@@ -135,7 +186,7 @@ async function main() {
   const ui = spawnSync(process.execPath, [UI, ...extra], {
     stdio: "inherit",
     cwd: here, // keep backups/ next to the tool
-    env: { ...process.env, BW_SESSION: session },
+    env: { ...process.env, BW_SESSION: session, ...(activeBwPath ? { FAVICO_BW_PATH: activeBwPath } : {}) },
   });
   process.exit(ui.status || 0);
 }

@@ -3,6 +3,7 @@ backups/
 bw-backup*.json
 
 node_modules/
+.favico-runtime/
 *.log
 .DS_Store
 
